@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, memo, useCallback } from 'react';
 import { 
   Terminal, 
   MapPin, 
@@ -11,7 +11,10 @@ import {
   CloudLightning, 
   Snowflake, 
   CloudFog,
-  CloudSun
+  CloudSun,
+  Compass,
+  Navigation,
+  AlertCircle
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -34,15 +37,19 @@ type WeatherData = {
   description: string;
 };
 
-// --- Helpers ---
+// Extend standard event to support iOS properties
+interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
+  webkitCompassHeading?: number;
+  requestPermission?: () => Promise<'granted' | 'denied'>;
+}
 
-// 1. Coordinate Formatter
+// --- Static Helpers ---
+
 const formatCoordinate = (value: number, type: 'lat' | 'lng'): string => {
   const direction = type === 'lat' ? (value >= 0 ? 'N' : 'S') : (value >= 0 ? 'E' : 'W');
   return `${Math.abs(value).toFixed(7)}°${direction}`;
 };
 
-// 2. Weather Code Interpreter (WMO Codes)
 const getWeatherInfo = (code: number) => {
   if (code === 0) return { label: "Clear Sky", icon: Sun };
   if (code >= 1 && code <= 3) return { label: "Partly Cloudy", icon: CloudSun };
@@ -56,17 +63,18 @@ const getWeatherInfo = (code: number) => {
 
 // --- Custom Hooks ---
 
-// 1. Geolocation
+// 1. Geolocation Hook
 const useGeolocation = (options?: PositionOptions) => {
   const [state, setState] = useState<GeoState>({
     coords: null,
     error: null,
     loading: true,
   });
-  const watcherRef = useRef<number | null>(null);
+  
+  const stableOptions = useRef(options);
 
   useEffect(() => {
-    if (!navigator.geolocation) {
+    if (typeof window === 'undefined' || !navigator.geolocation) {
       setState((s) => ({ ...s, loading: false, error: "Geolocation not supported." }));
       return;
     }
@@ -75,7 +83,8 @@ const useGeolocation = (options?: PositionOptions) => {
       setState((prev) => {
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
-            prev.coords.longitude === coords.longitude) {
+            prev.coords.longitude === coords.longitude &&
+            prev.coords.accuracy === coords.accuracy) {
           return prev;
         }
         return {
@@ -100,21 +109,98 @@ const useGeolocation = (options?: PositionOptions) => {
       setState((s) => ({ ...s, loading: false, error: message }));
     };
 
-    watcherRef.current = navigator.geolocation.watchPosition(
+    const watcher = navigator.geolocation.watchPosition(
       handleSuccess,
       handleError,
-      options ?? { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      stableOptions.current ?? { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
 
-    return () => {
-      if (watcherRef.current !== null) navigator.geolocation.clearWatch(watcherRef.current);
-    };
-  }, [options]);
+    return () => navigator.geolocation.clearWatch(watcher);
+  }, []);
 
   return state;
 };
 
-// 2. Debounce
+// 2. Compass Hook (Fixed Types)
+const useCompass = () => {
+  const [heading, setHeading] = useState<number | null>(null);
+  const [permissionGranted, setPermissionGranted] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const requestAccess = useCallback(async () => {
+    // iOS 13+ Check
+    const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission === 'function';
+    
+    if (isIOS) {
+      try {
+        const response = await (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission!();
+        if (response === 'granted') {
+          setPermissionGranted(true);
+          setError(null);
+        } else {
+          setError("Compass permission denied");
+        }
+      } catch (e) {
+        console.error(e);
+        setError("Compass not supported");
+      }
+    } else {
+      setPermissionGranted(true);
+      setError(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!permissionGranted) return;
+
+    let animationFrameId: number;
+    
+    const handleOrientation = (e: Event) => {
+      const event = e as DeviceOrientationEventiOS;
+      
+      cancelAnimationFrame(animationFrameId);
+      animationFrameId = requestAnimationFrame(() => {
+        let compass: number | null = null;
+        
+        // iOS
+        if (typeof event.webkitCompassHeading === 'number') {
+          compass = event.webkitCompassHeading;
+        } 
+        // Android / Standard
+        else if (event.alpha !== null) {
+          compass = 360 - event.alpha; 
+        }
+
+        if (compass !== null) {
+          compass = (compass + 360) % 360;
+          setHeading(compass);
+        }
+      });
+    };
+
+    // FIX: Cast window to 'any' to avoid "Property does not exist on type 'never'"
+    const win = window as any;
+
+    if ('ondeviceorientationabsolute' in win) {
+      win.addEventListener('deviceorientationabsolute', handleOrientation, true);
+    } else {
+      window.addEventListener('deviceorientation', handleOrientation, true);
+    }
+
+    return () => {
+      if ('ondeviceorientationabsolute' in win) {
+        win.removeEventListener('deviceorientationabsolute', handleOrientation, true);
+      } else {
+        window.removeEventListener('deviceorientation', handleOrientation);
+      }
+      cancelAnimationFrame(animationFrameId);
+    };
+  }, [permissionGranted]);
+
+  return { heading, requestAccess, permissionGranted, error };
+};
+
+// 3. Debounce Hook
 const useDebounce = <T,>(value: T, delay: number): T => {
   const [debouncedValue, setDebouncedValue] = useState(value);
   useEffect(() => {
@@ -124,44 +210,13 @@ const useDebounce = <T,>(value: T, delay: number): T => {
   return debouncedValue;
 };
 
-// 3. Weather Hook
-const useWeather = (coords: Coordinates | null) => {
-  const [weather, setWeather] = useState<WeatherData | null>(null);
-  
-  useEffect(() => {
-    if (!coords) return;
-    
-    const fetchWeather = async () => {
-      try {
-        const res = await fetch(
-          `https://api.open-meteo.com/v1/forecast?latitude=${coords.latitude}&longitude=${coords.longitude}&current=temperature_2m,weather_code&timezone=auto`
-        );
-        const data = await res.json();
-        const info = getWeatherInfo(data.current.weather_code);
-        
-        setWeather({
-          temp: data.current.temperature_2m,
-          code: data.current.weather_code,
-          description: info.label
-        });
-      } catch (e) {
-        console.error("Weather fetch failed", e);
-      }
-    };
+// --- UI Components ---
 
-    fetchWeather();
-  }, [coords]);
-
-  return weather;
-};
-
-// --- UI Sub-Component ---
-const CoordinateDisplay = ({ label, value, type }: { label: string; value: number; type: 'lat' | 'lng' }) => {
+const CoordinateDisplay = memo(({ label, value, type }: { label: string; value: number; type: 'lat' | 'lng' }) => {
   const formattedValue = useMemo(() => formatCoordinate(value, type), [value, type]);
   
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(formattedValue);
+    const triggerVisual = () => {
       const el = document.getElementById(`val-${type}`);
       if (el) {
         el.style.transition = "none"; 
@@ -171,16 +226,36 @@ const CoordinateDisplay = ({ label, value, type }: { label: string; value: numbe
           el.style.color = "";
         }, 150);
       }
-    } catch (err) { console.error(err); }
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(formattedValue);
+        triggerVisual();
+        return;
+      } catch (e) { /* fallback */ }
+    }
+
+    try {
+      const textArea = document.createElement("textarea");
+      textArea.value = formattedValue;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+      triggerVisual();
+    } catch (e) {
+      console.error("Copy failed", e);
+    }
   };
 
   return (
     <div 
       className="group cursor-pointer flex flex-col items-center justify-center transition-transform duration-200 hover:scale-105 active:scale-95"
       onClick={handleCopy}
-      title="Click to copy"
       role="button"
       tabIndex={0}
+      aria-label={`Copy ${label}`}
     >
       <span className="text-xs md:text-sm text-muted-foreground uppercase tracking-[0.2em] mb-2 font-semibold select-none">
         {label}
@@ -193,56 +268,103 @@ const CoordinateDisplay = ({ label, value, type }: { label: string; value: numbe
       </span>
     </div>
   );
-};
+});
+CoordinateDisplay.displayName = "CoordinateDisplay";
+
+const SmallCompass = memo(({ heading, onClick, hasError }: { heading: number | null, onClick: () => void, hasError: boolean }) => {
+  return (
+    <div 
+      className={`relative flex items-center justify-center w-10 h-10 rounded-full bg-muted/20 border transition-colors ${hasError ? 'border-destructive/50 bg-destructive/10' : 'border-border/50 hover:bg-muted/30 cursor-pointer'}`}
+      onClick={onClick}
+      title={heading ? `${heading.toFixed(0)}°` : "Click to enable compass"}
+    >
+      {hasError ? (
+        <AlertCircle className="w-5 h-5 text-destructive" />
+      ) : !heading ? (
+        <Compass className="w-5 h-5 text-muted-foreground" />
+      ) : (
+        <div 
+          className="w-full h-full relative flex items-center justify-center transition-transform duration-100 ease-out will-change-transform"
+          style={{ transform: `rotate(${-heading}deg)` }}
+        >
+          <div className="absolute top-1 w-1.5 h-1.5 bg-red-500 rounded-full shadow-[0_0_8px_rgba(239,68,68,0.6)]" />
+          <Navigation className="w-5 h-5 text-foreground fill-foreground" />
+          <div className="absolute top-0 w-[1px] h-1.5 bg-muted-foreground/30" />
+          <div className="absolute bottom-0 w-[1px] h-1.5 bg-muted-foreground/30" />
+          <div className="absolute left-0 h-[1px] w-1.5 bg-muted-foreground/30" />
+          <div className="absolute right-0 h-[1px] w-1.5 bg-muted-foreground/30" />
+        </div>
+      )}
+    </div>
+  );
+});
+SmallCompass.displayName = "SmallCompass";
 
 // --- Main Component ---
 export default function GeoLocation() {
   const { coords, error, loading } = useGeolocation();
+  const { heading, requestAccess, permissionGranted, error: compassError } = useCompass();
+  
   const [address, setAddress] = useState<string | null>(null);
-  const [isAddressLoading, setIsAddressLoading] = useState(false);
+  const [weather, setWeather] = useState<WeatherData | null>(null);
+  const [isCtxLoading, setIsCtxLoading] = useState(false);
   
-  // Debounce logic
   const debouncedCoords = useDebounce(coords, 1200);
-  
-  // Fetch Weather using debounced coords
-  const weather = useWeather(debouncedCoords);
 
-  // Address Fetching
   useEffect(() => {
     if (!debouncedCoords) return;
-    const controller = new AbortController();
     
-    const fetchAddress = async () => {
-      setIsAddressLoading(true);
+    const controller = new AbortController();
+    setIsCtxLoading(true);
+
+    const fetchData = async () => {
       try {
-        const res = await fetch(
-          `https://nominatim.openstreetmap.org/reverse?format=json&lat=${debouncedCoords.latitude}&lon=${debouncedCoords.longitude}`,
-          { signal: controller.signal }
-        );
-        if (!res.ok) throw new Error("Error");
-        const data = await res.json();
-        const addr = data.address;
-        const city = addr.city || addr.town || addr.village || addr.county || addr.state_district || addr.suburb;
-        setAddress([city, addr.country].filter(Boolean).join(', '));
-      } catch (err) { 
-        /* ignore */ 
+        const [geoRes, weatherRes] = await Promise.allSettled([
+          fetch(
+            `https://nominatim.openstreetmap.org/reverse?format=json&lat=${debouncedCoords.latitude}&lon=${debouncedCoords.longitude}`,
+            { signal: controller.signal }
+          ),
+          fetch(
+            `https://api.open-meteo.com/v1/forecast?latitude=${debouncedCoords.latitude}&longitude=${debouncedCoords.longitude}&current=temperature_2m,weather_code&timezone=auto`,
+            { signal: controller.signal }
+          )
+        ]);
+
+        if (geoRes.status === 'fulfilled' && geoRes.value.ok) {
+          const data = await geoRes.value.json();
+          const addr = data.address;
+          if (addr) {
+            const city = addr.city || addr.town || addr.village || addr.county || addr.suburb || "";
+            const country = addr.country || "";
+            setAddress([city, country].filter(Boolean).join(', '));
+          }
+        }
+
+        if (weatherRes.status === 'fulfilled' && weatherRes.value.ok) {
+          const data = await weatherRes.value.json();
+          const info = getWeatherInfo(data.current.weather_code);
+          setWeather({
+            temp: data.current.temperature_2m,
+            code: data.current.weather_code,
+            description: info.label
+          });
+        }
+      } catch (err) {
       } finally {
-        setIsAddressLoading(false);
+        setIsCtxLoading(false);
       }
     };
 
-    fetchAddress();
+    fetchData();
     return () => controller.abort();
   }, [debouncedCoords]);
 
-  // Determine dynamic weather icon
   const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
 
   return (
     <main className="flex flex-col items-center justify-center min-h-screen bg-background text-foreground p-4">
       <div className="w-full max-w-7xl flex flex-col items-center justify-center space-y-8 md:space-y-12">
         
-        {/* Loading */}
         {loading && !coords && (
           <div className="animate-pulse flex flex-col items-center space-y-8">
             <div className="h-16 w-64 bg-muted/20 rounded-md" />
@@ -254,7 +376,6 @@ export default function GeoLocation() {
           </div>
         )}
 
-        {/* Error */}
         {error && !coords && (
           <Alert variant="destructive" className="max-w-md border-none bg-transparent text-center p-0">
             <div className="flex flex-col items-center gap-3">
@@ -265,7 +386,6 @@ export default function GeoLocation() {
           </Alert>
         )}
 
-        {/* Success */}
         {coords && (
           <>
             <div className="flex flex-col xl:flex-row gap-8 xl:gap-24 items-center justify-center animate-fade-in text-center">
@@ -274,35 +394,44 @@ export default function GeoLocation() {
               <CoordinateDisplay label="Longitude" value={coords.longitude} type="lng" />
             </div>
 
-            {/* Context Info (Address + Weather) */}
-            <div className="flex flex-col items-center gap-3 animate-in fade-in slide-in-from-bottom-2 duration-700">
-              
-              {/* Address */}
-              <div className="flex items-center gap-2 text-muted-foreground">
+            <div className="min-h-[80px] flex flex-col items-center gap-4 animate-in fade-in slide-in-from-bottom-2 duration-700">
+              <div className="flex items-center gap-2 text-muted-foreground h-6">
                 <MapPin className="w-4 h-4 text-accent" />
-                <span className={`text-lg md:text-xl font-light tracking-wide transition-opacity duration-500 ${isAddressLoading ? 'opacity-50' : 'opacity-100'}`}>
-                  {address || (isAddressLoading ? "Identifying location..." : "Unknown Location")}
+                <span className={`text-lg md:text-xl font-light tracking-wide transition-opacity duration-500 ${isCtxLoading ? 'opacity-50' : 'opacity-100'}`}>
+                  {address || (isCtxLoading ? "Identifying location..." : "Unknown Location")}
                 </span>
               </div>
 
-              {/* Weather */}
-              {weather && (
-                <div className="flex items-center gap-3 text-muted-foreground/80 bg-muted/20 px-4 py-1.5 rounded-full border border-border/50">
-                  <WeatherIcon className="w-4 h-4" />
-                  <span className="text-sm font-medium">
-                    {weather.temp.toFixed(1)}°C
-                  </span>
-                  <span className="text-xs opacity-50 border-l border-foreground/20 pl-3 uppercase tracking-wider">
-                    {weather.description}
-                  </span>
-                </div>
-              )}
+              <div className={`flex items-center gap-3 transition-all duration-500 ${weather ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'}`}>
+                {weather && (
+                  <div className="flex items-center gap-3 text-muted-foreground/80 bg-muted/20 px-4 py-2 rounded-full border border-border/50">
+                    <WeatherIcon className="w-4 h-4" />
+                    <span className="text-sm font-medium">
+                      {weather.temp.toFixed(1)}°C
+                    </span>
+                    <span className="text-xs opacity-50 border-l border-foreground/20 pl-3 uppercase tracking-wider">
+                      {weather.description}
+                    </span>
+                  </div>
+                )}
+
+                <SmallCompass 
+                  heading={heading} 
+                  onClick={requestAccess} 
+                  hasError={!!compassError}
+                />
+                
+                {!permissionGranted && !compassError && (
+                   <span className="text-[10px] text-muted-foreground/40 uppercase tracking-widest animate-pulse">
+                     Tap Compass
+                   </span>
+                )}
+              </div>
             </div>
 
-            {/* Footer */}
             {coords.accuracy && (
               <p className="fixed bottom-8 text-xs text-muted-foreground/30 font-mono select-none">
-                GPS Accuracy: ±{coords.accuracy.toFixed(0)}m
+                GPS ±{coords.accuracy.toFixed(0)}m
               </p>
             )}
           </>
