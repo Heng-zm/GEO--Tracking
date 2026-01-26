@@ -14,6 +14,7 @@ type Coordinates = {
   accuracy: number | null;
   altitude: number | null;
   speed: number | null;
+  heading: number | null;
 };
 
 type GeoState = {
@@ -36,8 +37,8 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 // --- Helpers ---
 const formatCoordinate = (value: number, type: 'lat' | 'lng'): string => {
   const direction = type === 'lat' ? (value >= 0 ? 'N' : 'S') : (value >= 0 ? 'E' : 'W');
-  // Using 6 decimals is standard for GPS precision (~11cm precision)
-  return `${Math.abs(value).toFixed(6)}°${direction}`;
+  // 7 decimals = ~11mm precision (Detects small movements)
+  return `${Math.abs(value).toFixed(7)}°${direction}`;
 };
 
 const getWeatherInfo = (code: number) => {
@@ -53,7 +54,6 @@ const getWeatherInfo = (code: number) => {
 
 const getCompassDirection = (degree: number) => {
   const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-  // Normalize degree to 0-360 before calculating index
   const normalized = ((degree % 360) + 360) % 360;
   return directions[Math.round(normalized / 45) % 8];
 };
@@ -71,12 +71,12 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       setState(prev => {
-        // Deep comparison to prevent re-renders if data is identical
+        // High-frequency update filter: Only update React state if data actually changed
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
-            prev.coords.accuracy === coords.accuracy &&
             prev.coords.speed === coords.speed &&
+            prev.coords.heading === coords.heading &&
             prev.coords.altitude === coords.altitude) {
           return prev;
         }
@@ -87,6 +87,7 @@ const useGeolocation = () => {
             accuracy: coords.accuracy,
             altitude: coords.altitude,
             speed: coords.speed,
+            heading: coords.heading,
           },
           error: null,
           loading: false,
@@ -104,11 +105,14 @@ const useGeolocation = () => {
       setState(s => ({ ...s, loading: false, error: message }));
     };
 
-    const watcher = navigator.geolocation.watchPosition(
-      handleSuccess,
-      handleError,
-      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
-    );
+    // Aggressive options for realtime tracking
+    const options: PositionOptions = { 
+      enableHighAccuracy: true, 
+      timeout: 5000, 
+      maximumAge: 0 // Do not use cached positions, force hardware ping
+    };
+    
+    const watcher = navigator.geolocation.watchPosition(handleSuccess, handleError, options);
     return () => navigator.geolocation.clearWatch(watcher);
   }, []);
 
@@ -116,13 +120,14 @@ const useGeolocation = () => {
 };
 
 const useCompass = () => {
-  const [heading, setHeading] = useState<number | null>(null);
+  const [visualHeading, setVisualHeading] = useState<number | null>(null);
+  const [trueHeading, setTrueHeading] = useState<number | null>(null);
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
-  // Refs for animation loop
-  const targetHeadingRef = useRef<number>(0);
-  const currentHeadingRef = useRef<number>(0);
+  // Physics engine refs
+  const targetRef = useRef<number>(0);
+  const currentRef = useRef<number>(0);
   const rafIdRef = useRef<number | null>(null);
 
   const requestAccess = useCallback(async () => {
@@ -145,49 +150,62 @@ const useCompass = () => {
     }
   }, []);
 
-  // Animation Loop for Smooth Physics (Lerp)
+  // Animation Loop (60Hz+)
   useEffect(() => {
     if (!permissionGranted) return;
 
-    const animate = () => {
-      // Linear Interpolation: Move 15% closer to target per frame
-      const diff = targetHeadingRef.current - currentHeadingRef.current;
-      if (Math.abs(diff) > 0.1) {
-        currentHeadingRef.current += diff * 0.15; 
-        setHeading(currentHeadingRef.current);
+    const loop = () => {
+      // Pause if tab is hidden to save battery
+      if (document.hidden) {
+        rafIdRef.current = requestAnimationFrame(loop);
+        return; 
       }
-      rafIdRef.current = requestAnimationFrame(animate);
-    };
-    animate();
 
+      // Physics Interpolation (Lerp)
+      // 0.4 factor = Very fast response (Realtime feel)
+      const smoothness = 0.4; 
+      const diff = targetRef.current - currentRef.current;
+      
+      // Update even on micro-movements (0.01 degree)
+      if (Math.abs(diff) > 0.01) {
+        currentRef.current += diff * smoothness;
+        setVisualHeading(currentRef.current);
+      }
+      
+      rafIdRef.current = requestAnimationFrame(loop);
+    };
+    
+    loop();
     return () => {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
     };
   }, [permissionGranted]);
 
-  // Event Listener
+  // Sensor Listener
   useEffect(() => {
     if (!permissionGranted) return;
 
     const handleOrientation = (e: any) => {
-      let newHeading: number | null = null;
+      let degree: number | null = null;
       
       if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
-        newHeading = e.webkitCompassHeading; // iOS
+        degree = e.webkitCompassHeading; // iOS
       } else if (e.alpha !== null) {
-        newHeading = 360 - e.alpha; // Android
+        degree = 360 - e.alpha; // Android
       }
 
-      if (newHeading !== null) {
-        // Shortest path logic for rotation
-        const current = targetHeadingRef.current;
-        const delta = newHeading - (current % 360);
-        
-        // Normalize delta to be between -180 and 180
-        let shortestDelta = ((delta + 180) % 360) - 180;
-        if (shortestDelta < -180) shortestDelta += 360;
+      if (degree !== null) {
+        setTrueHeading((degree + 360) % 360);
 
-        targetHeadingRef.current = current + shortestDelta;
+        // Calculate shortest rotation path (avoid 360->0 spin)
+        const current = targetRef.current;
+        const currentMod = (current % 360 + 360) % 360;
+        let delta = degree - currentMod;
+        
+        if (delta > 180) delta -= 360;
+        if (delta < -180) delta += 360;
+
+        targetRef.current = current + delta;
       }
     };
 
@@ -196,13 +214,7 @@ const useCompass = () => {
     return () => window.removeEventListener(eventName, handleOrientation, true);
   }, [permissionGranted]);
 
-  return { 
-    heading, // This is the smoothed visual value
-    trueHeading: targetHeadingRef.current, // This is the raw target
-    requestAccess, 
-    permissionGranted, 
-    error 
-  };
+  return { heading: visualHeading, trueHeading, requestAccess, permissionGranted, error };
 };
 
 const useDebounce = <T,>(value: T, delay: number): T => {
@@ -216,39 +228,27 @@ const useDebounce = <T,>(value: T, delay: number): T => {
 
 // --- UI Components ---
 
-// Memoized Compass Lines for performance
 const CompassTicks = memo(() => (
   <>
-    {/* Outer Ring */}
     <circle cx="50" cy="50" r="48" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/10 fill-none" />
-    
     {[...Array(60)].map((_, i) => {
-       const isCardinal = i % 15 === 0; // N, E, S, W
+       const isCardinal = i % 15 === 0;
        const isMajor = i % 5 === 0;  
        const length = isCardinal ? 10 : isMajor ? 7 : 4;
        const width = isCardinal ? 1.5 : isMajor ? 1 : 0.5;
        const colorClass = isCardinal ? "text-foreground" : isMajor ? "text-foreground/60" : "text-muted-foreground/30";
-       
        return (
           <line 
-            key={i} 
-            x1="50" y1="6" 
-            x2="50" y2={6 + length} 
+            key={i} x1="50" y1="6" x2="50" y2={6 + length} 
             transform={`rotate(${i * 6} 50 50)`} 
-            stroke="currentColor" 
-            strokeWidth={width} 
-            className={colorClass}
-            strokeLinecap="round"
+            stroke="currentColor" strokeWidth={width} className={colorClass} strokeLinecap="round"
           />
        )
     })}
-    {/* Labels */}
     <text x="50" y="28" textAnchor="middle" className="text-[7px] font-black fill-red-500" transform="rotate(0 50 50)">N</text>
     <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(90 50 50)">E</text>
     <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(180 50 50)">S</text>
     <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(270 50 50)">W</text>
-    
-    {/* Center Decoration */}
     <circle cx="50" cy="50" r="1.5" className="fill-foreground/20" />
     <line x1="40" y1="50" x2="60" y2="50" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
     <line x1="50" y1="40" x2="50" y2="60" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
@@ -269,10 +269,9 @@ const CompassDisplay = memo(({
   hasError: boolean, 
   permissionGranted: boolean 
 }) => {
-  
   const rotation = heading ? -heading : 0;
-  const normalizedHeading = trueHeading ? ((trueHeading % 360) + 360) % 360 : 0;
   const directionStr = trueHeading ? getCompassDirection(trueHeading) : "--";
+  const displayHeading = trueHeading ? Math.round(trueHeading) : 0;
 
   return (
     <div className="flex flex-col items-center justify-center mb-4 relative z-10 animate-in zoom-in-50 duration-700 fade-in">
@@ -280,12 +279,12 @@ const CompassDisplay = memo(({
         className="relative w-72 h-72 md:w-80 md:h-80 cursor-pointer group tap-highlight-transparent"
         onClick={onClick}
       >
-         {/* Fixed Top Marker (The actual needle pointer) */}
+         {/* Red Pointer */}
          <div className="absolute top-0 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
              <div className="w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[10px] border-t-red-500/80 drop-shadow-lg filter blur-[0.2px]" />
          </div>
-
-         {/* The Rotating Dial */}
+         
+         {/* Rotating Dial */}
          <div 
             className="w-full h-full will-change-transform"
             style={{ transform: `rotate(${rotation}deg)` }}
@@ -295,14 +294,16 @@ const CompassDisplay = memo(({
            </svg>
          </div>
 
-         {/* Call to Action Overlay */}
+         {/* Permission Button */}
          {!permissionGranted && !hasError && (
              <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-background/5 backdrop-blur-[1px]">
-                <button className="text-[10px] font-bold uppercase tracking-[0.2em] text-foreground/80 animate-pulse bg-background/80 backdrop-blur-md px-6 py-3 rounded-full border border-border/40 shadow-xl hover:scale-105 transition-transform">
+                <button className="text-[10px] font-bold uppercase tracking-[0.2em] text-foreground/80 animate-pulse bg-background/80 backdrop-blur-md px-6 py-3 rounded-full border border-border/40 shadow-xl hover:scale-105 transition-transform active:scale-95">
                    Tap to Align
                 </button>
              </div>
          )}
+         
+         {/* Error State */}
          {hasError && (
             <div className="absolute inset-0 flex items-center justify-center z-30 bg-background/50 backdrop-blur-sm rounded-full">
                 <AlertCircle className="w-10 h-10 text-destructive/80" />
@@ -310,10 +311,10 @@ const CompassDisplay = memo(({
          )}
       </div>
 
-      {/* Digital Heading */}
+      {/* Heading Text */}
       <div className="mt-4 flex flex-col items-center">
         <div className="text-6xl font-mono font-black tracking-tighter tabular-nums text-foreground select-all">
-          {permissionGranted ? normalizedHeading.toFixed(0) : "--"}°
+          {permissionGranted ? displayHeading : "--"}°
         </div>
         <div className="text-sm font-bold text-muted-foreground/60 tracking-[0.5em] uppercase mt-2">
           {permissionGranted ? directionStr : "---"}
@@ -329,13 +330,12 @@ const CoordinateDisplay = memo(({ label, value, type }: { label: string; value: 
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
-    if (navigator.clipboard?.writeText) {
-      try { 
-        await navigator.clipboard.writeText(formattedValue); 
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-      } catch (e) { }
-    }
+    if (!navigator.clipboard) return;
+    try { 
+      await navigator.clipboard.writeText(formattedValue); 
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {}
   };
 
   return (
@@ -344,7 +344,7 @@ const CoordinateDisplay = memo(({ label, value, type }: { label: string; value: 
       onClick={handleCopy}
     >
       <span className={`text-[9px] uppercase tracking-[0.25em] mb-2 font-bold select-none transition-colors duration-300 ${copied ? "text-green-500" : "text-muted-foreground"}`}>
-        {copied ? "COPIED TO CLIPBOARD" : label}
+        {copied ? "COPIED" : label}
       </span>
       <span 
         className={`text-3xl md:text-5xl lg:text-6xl font-black tracking-tighter font-mono tabular-nums transition-colors duration-300 select-all whitespace-nowrap ${copied ? "text-green-500" : "text-foreground"}`}
@@ -375,8 +375,9 @@ export default function GeoLocation() {
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [isCtxLoading, setIsCtxLoading] = useState(false);
   
-  // Increase debounce time to avoid API rate limits when moving rapidly
-  const debouncedCoords = useDebounce(coords, 2500);
+  // API Calls MUST be debounced to prevent rate limits/bans (3 seconds)
+  // This does NOT affect the coordinate display, which is realtime.
+  const debouncedCoords = useDebounce(coords, 3000);
 
   useEffect(() => {
     if (!debouncedCoords) return;
@@ -395,16 +396,7 @@ export default function GeoLocation() {
           const data = await geoRes.value.json();
           const addr = data.address;
           if (addr) {
-            // Prioritize specific locality names
-            const locationStr = [
-               addr.city, 
-               addr.town, 
-               addr.village, 
-               addr.hamlet,
-               addr.county,
-               addr.state 
-            ].find(val => val && val.length > 0) || "Unknown Location";
-            
+            const locationStr = [addr.city, addr.town, addr.village, addr.hamlet, addr.county].find(val => val && val.length > 0) || "Unknown Location";
             const countryStr = addr.country_code ? addr.country_code.toUpperCase() : "";
             setAddress(countryStr ? `${locationStr}, ${countryStr}` : locationStr);
           }
@@ -415,9 +407,7 @@ export default function GeoLocation() {
           const info = getWeatherInfo(data.current.weather_code);
           setWeather({ temp: data.current.temperature_2m, code: data.current.weather_code, description: info.label });
         }
-      } catch (err) {
-        // Silent catch for aborts
-      } finally { 
+      } catch (err) {} finally { 
         setIsCtxLoading(false); 
       }
     };
@@ -432,7 +422,6 @@ export default function GeoLocation() {
     <main className="flex flex-col items-center justify-center min-h-screen bg-background text-foreground p-4 overflow-hidden touch-manipulation select-none">
       <div className="w-full max-w-7xl flex flex-col items-center justify-start space-y-8 md:space-y-12 pb-10">
         
-        {/* Floating Rotating Compass */}
         <CompassDisplay 
           heading={heading}
           trueHeading={trueHeading}
@@ -455,17 +444,18 @@ export default function GeoLocation() {
           </Alert>
         )}
 
+        {/* Note: `coords` is passed raw (not debounced) for instant display */}
         {coords && (
           <div className="w-full flex flex-col items-center gap-8 md:gap-12 animate-in slide-in-from-bottom-4 fade-in duration-700">
             
-            {/* Coordinates */}
+            {/* Coordinate Grid */}
             <div className="flex flex-col xl:flex-row gap-8 xl:gap-24 items-center justify-center text-center">
               <CoordinateDisplay label="Latitude" value={coords.latitude} type="lat" />
               <div className="hidden xl:block h-16 w-px bg-border/40" />
               <CoordinateDisplay label="Longitude" value={coords.longitude} type="lng" />
             </div>
 
-            {/* Stats */}
+            {/* Live Stats */}
             <div className="flex flex-wrap justify-center gap-6 md:gap-16 border-t border-border/20 pt-8 w-full max-w-2xl">
                 {coords.altitude !== null && (
                     <StatMinimal icon={Mountain} label="Alt" value={`${Math.round(coords.altitude)} m`} />
@@ -482,20 +472,18 @@ export default function GeoLocation() {
                 />
             </div>
 
-            {/* Footer Context (Address & Weather) */}
+            {/* Context Pill (Address/Weather) */}
             <div className="w-full flex flex-col items-center gap-3 mt-2">
               <button 
                 onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${coords.latitude},${coords.longitude}`, '_blank')}
-                className="group flex items-center gap-2.5 text-muted-foreground hover:text-foreground transition-all duration-300 px-4 py-2 rounded-full hover:bg-muted/30"
+                className="group flex items-center gap-2.5 text-muted-foreground hover:text-foreground transition-all duration-300 px-4 py-2 rounded-full hover:bg-muted/30 active:scale-95"
               >
                 <MapPin className="w-4 h-4 text-red-500/80 group-hover:scale-110 transition-transform" />
-                
-                {/* Address Skeleton Loader */}
                 {(!address && isCtxLoading) ? (
                    <div className="h-4 w-32 bg-muted-foreground/10 animate-pulse rounded" />
                 ) : (
                    <span className="text-lg font-light tracking-wide text-center">
-                     {address || "Unknown Location"}
+                     {address || "Locating..."}
                    </span>
                 )}
               </button>
