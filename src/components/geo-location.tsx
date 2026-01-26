@@ -15,7 +15,8 @@ import {
   AlertCircle,
   Mountain,
   Activity,
-  Navigation
+  Navigation,
+  Triangle
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -40,7 +41,6 @@ type WeatherData = {
   description: string;
 };
 
-// iOS specific event extension
 interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
   webkitCompassHeading?: number;
   requestPermission?: () => Promise<'granted' | 'denied'>;
@@ -88,7 +88,6 @@ const useGeolocation = (options?: PositionOptions) => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       setState((prev) => {
-        // Deep comparison optimization
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
@@ -173,16 +172,15 @@ const useCompass = () => {
           // iOS
           newHeading = event.webkitCompassHeading;
         } else if (event.alpha !== null) {
-          // Android (360 - alpha) usually gives clockwise heading from North
+          // Android: alpha is counter-clockwise. Heading = 360 - alpha
           newHeading = 360 - event.alpha; 
         }
 
         if (newHeading !== null) {
-          // Normalize 0-360
           const normalized = (newHeading + 360) % 360;
           setTrueHeading(normalized);
 
-          // Shortest Path Interpolation to prevent spinning
+          // Interpolation to prevent spinning when crossing 360->0
           let delta = normalized - (cumulativeRef.current % 360);
           if (delta > 180) delta -= 360;
           if (delta < -180) delta += 360;
@@ -231,34 +229,44 @@ const CompassDisplay = memo(({
   permissionGranted: boolean 
 }) => {
   
+  // Rotate the CARD/DIAL, not the needle. 
+  // If heading is 90 (East), dial rotates -90 so "E" is at the top.
   const rotation = heading ? -heading : 0;
   const directionStr = trueHeading ? getCompassDirection(trueHeading) : "--";
 
   return (
     <div className="flex flex-col items-center justify-center mb-6 relative z-10 animate-in zoom-in-50 duration-700">
+      
       {/* Clickable Compass Area */}
       <div 
         className="relative w-72 h-72 md:w-80 md:h-80 cursor-pointer group tap-highlight-transparent"
         onClick={onClick}
       >
-         {/* Minimalist Dial (No borders/background) */}
-         <div className="relative w-full h-full p-4">
+         {/* Fixed Top Marker (Device Heading Indicator) */}
+         <div className="absolute top-0 left-1/2 -translate-x-1/2 z-20">
+             <div className="w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[10px] border-t-accent drop-shadow-md" />
+         </div>
+
+         {/* The Rotating Dial */}
+         <div 
+            className="w-full h-full will-change-transform transition-transform duration-500 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
+            style={{ transform: `rotate(${rotation}deg)` }}
+         >
            <svg viewBox="0 0 100 100" className="w-full h-full select-none pointer-events-none">
               
               {/* Ticks */}
               {[...Array(60)].map((_, i) => {
                  const isMajor = i % 15 === 0; // N, E, S, W
                  const isMinor = i % 5 === 0;  
-                 const length = isMajor ? 8 : isMinor ? 5 : 2;
-                 const width = isMajor ? 1.2 : isMinor ? 0.6 : 0.3;
-                 // Major ticks slightly brighter
-                 const colorClass = isMajor ? "text-foreground" : "text-muted-foreground/50";
+                 const length = isMajor ? 12 : isMinor ? 7 : 4;
+                 const width = isMajor ? 1.5 : isMinor ? 0.8 : 0.4;
+                 const colorClass = isMajor ? "text-foreground" : "text-muted-foreground/40";
                  
                  return (
                     <line 
                       key={i} 
-                      x1="50" y1="2" 
-                      x2="50" y2={2 + length} 
+                      x1="50" y1="5" 
+                      x2="50" y2={5 + length} 
                       transform={`rotate(${i * 6} 50 50)`} 
                       stroke="currentColor" 
                       strokeWidth={width} 
@@ -267,46 +275,40 @@ const CompassDisplay = memo(({
                  )
               })}
               
-              {/* Cardinal Labels - Floating */}
-              <text x="50" y="20" textAnchor="middle" className="text-[7px] font-black fill-red-500">N</text>
-              <text x="82" y="52" textAnchor="middle" className="text-[6px] font-bold fill-foreground">E</text>
-              <text x="50" y="85" textAnchor="middle" className="text-[6px] font-bold fill-foreground">S</text>
-              <text x="18" y="52" textAnchor="middle" className="text-[6px] font-bold fill-foreground">W</text>
+              {/* Labels (Oriented to center) */}
+              {/* North */}
+              <text x="50" y="26" textAnchor="middle" className="text-[8px] font-black fill-red-500" transform="rotate(0 50 50)">N</text>
+              {/* East */}
+              <text x="50" y="26" textAnchor="middle" className="text-[7px] font-bold fill-foreground" transform="rotate(90 50 50)">E</text>
+              {/* South */}
+              <text x="50" y="26" textAnchor="middle" className="text-[7px] font-bold fill-foreground" transform="rotate(180 50 50)">S</text>
+              {/* West */}
+              <text x="50" y="26" textAnchor="middle" className="text-[7px] font-bold fill-foreground" transform="rotate(270 50 50)">W</text>
 
-              {/* Minimal Needle */}
-              <g 
-                transform={`rotate(${rotation} 50 50)`}
-                className="will-change-transform transition-transform duration-500 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
-              >
-                 {/* North (Red Tip) */}
-                 <path d="M50 15 L53 50 L50 50 L47 50 Z" fill="#EF4444" />
-                 
-                 {/* South (Ghost/Outline) */}
-                 <path d="M50 85 L53 50 L50 50 L47 50 Z" className="fill-muted-foreground/50" />
-                 
-                 {/* Center Dot */}
-                 <circle cx="50" cy="50" r="1.5" className="fill-background stroke-foreground stroke-[0.5]" />
-              </g>
+              {/* Center Crosshair (Fixed to dial) */}
+              <circle cx="50" cy="50" r="1.5" className="fill-muted-foreground/50" />
+              <line x1="45" y1="50" x2="55" y2="50" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
+              <line x1="50" y1="45" x2="50" y2="55" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
            </svg>
          </div>
 
-         {/* Call to Action Overlay (if disabled) */}
+         {/* Call to Action Overlay */}
          {!permissionGranted && !hasError && (
-             <div className="absolute inset-0 flex items-center justify-center rounded-full z-20">
-                <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground animate-pulse">
-                   Tap Compass
+             <div className="absolute inset-0 flex items-center justify-center rounded-full z-30">
+                <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground animate-pulse bg-background/50 backdrop-blur-sm px-4 py-2 rounded-full border border-border/20">
+                   Tap to Activate
                 </span>
              </div>
          )}
          {hasError && (
-            <div className="absolute inset-0 flex items-center justify-center z-20">
+            <div className="absolute inset-0 flex items-center justify-center z-30">
                 <AlertCircle className="w-8 h-8 text-destructive/80" />
             </div>
          )}
       </div>
 
-      {/* Digital Heading (No Box) */}
-      <div className="mt-4 flex flex-col items-center">
+      {/* Digital Heading */}
+      <div className="mt-2 flex flex-col items-center">
         <div className="text-6xl font-mono font-black tracking-tighter tabular-nums text-foreground">
           {trueHeading !== null ? trueHeading.toFixed(0) : "--"}°
         </div>
@@ -416,7 +418,7 @@ export default function GeoLocation() {
     <main className="flex flex-col items-center justify-center min-h-screen bg-background text-foreground p-4 py-8 overflow-x-hidden">
       <div className="w-full max-w-7xl flex flex-col items-center justify-start space-y-12">
         
-        {/* Floating Compass */}
+        {/* Floating Rotating Compass */}
         <CompassDisplay 
           heading={visualHeading}
           trueHeading={trueHeading}
@@ -444,7 +446,6 @@ export default function GeoLocation() {
             {/* Coordinates */}
             <div className="flex flex-col xl:flex-row gap-8 xl:gap-24 items-center justify-center text-center">
               <CoordinateDisplay label="Latitude" value={coords.latitude} type="lat" />
-              {/* Minimal Divider */}
               <div className="hidden xl:block h-12 w-px bg-border/30" />
               <CoordinateDisplay label="Longitude" value={coords.longitude} type="lng" />
             </div>
@@ -457,7 +458,6 @@ export default function GeoLocation() {
                 {coords.speed !== null && coords.speed > 0 && (
                     <StatMinimal icon={Activity} label="Spd" value={`${(coords.speed * 3.6).toFixed(1)} km/h`} />
                 )}
-                {/* Accuracy as a stat now */}
                 {coords.accuracy && (
                     <StatMinimal icon={Navigation} label="Acc" value={`±${coords.accuracy.toFixed(0)}m`} />
                 )}
@@ -465,12 +465,10 @@ export default function GeoLocation() {
 
             {/* Footer Context (Address & Weather) */}
             <div className="w-full flex flex-col items-center gap-4">
-              
-              {/* Address (Clean Link Style) */}
+              {/* Address */}
               <button 
                 onClick={openMaps}
                 className="group flex items-center gap-2 text-muted-foreground hover:text-foreground transition-colors"
-                title="View on Maps"
               >
                 <MapPin className="w-3.5 h-3.5 text-accent group-hover:scale-110 transition-transform" />
                 <span className={`text-lg font-light tracking-wide text-center group-hover:underline underline-offset-4 decoration-dotted ${isCtxLoading ? 'opacity-50' : 'opacity-100'}`}>
@@ -478,7 +476,7 @@ export default function GeoLocation() {
                 </span>
               </button>
 
-              {/* Weather (Floating Text/Icon) */}
+              {/* Weather */}
               {weather && (
                   <div className="flex items-center gap-3 text-muted-foreground/70">
                     <WeatherIcon className="w-4 h-4" />
