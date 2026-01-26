@@ -2,21 +2,8 @@
 
 import React, { useState, useEffect, useRef, useMemo, memo, useCallback } from 'react';
 import { 
-  Terminal, 
-  MapPin, 
-  RefreshCcw, 
-  Sun, 
-  Cloud, 
-  CloudRain, 
-  CloudLightning, 
-  Snowflake, 
-  CloudFog,
-  CloudSun,
-  AlertCircle,
-  Mountain,
-  Activity,
-  Navigation,
-  Triangle
+  Sun, Cloud, CloudRain, CloudLightning, Snowflake, CloudFog, CloudSun,
+  AlertCircle, Mountain, Activity, Navigation, MapPin, RefreshCcw, Loader2
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -49,50 +36,48 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 // --- Helpers ---
 const formatCoordinate = (value: number, type: 'lat' | 'lng'): string => {
   const direction = type === 'lat' ? (value >= 0 ? 'N' : 'S') : (value >= 0 ? 'E' : 'W');
-  return `${Math.abs(value).toFixed(7)}°${direction}`;
+  // Using 6 decimals is standard for GPS precision (~11cm precision)
+  return `${Math.abs(value).toFixed(6)}°${direction}`;
 };
 
 const getWeatherInfo = (code: number) => {
   if (code === 0) return { label: "Clear", icon: Sun };
-  if (code >= 1 && code <= 3) return { label: "Cloudy", icon: CloudSun };
-  if (code >= 45 && code <= 48) return { label: "Fog", icon: CloudFog };
-  if (code >= 51 && code <= 67) return { label: "Rain", icon: CloudRain };
-  if (code >= 71 && code <= 77) return { label: "Snow", icon: Snowflake };
-  if (code >= 80 && code <= 82) return { label: "Heavy Rain", icon: CloudRain };
+  if (code <= 3) return { label: "Cloudy", icon: CloudSun };
+  if (code <= 48) return { label: "Fog", icon: CloudFog };
+  if (code <= 67) return { label: "Rain", icon: CloudRain };
+  if (code <= 77) return { label: "Snow", icon: Snowflake };
+  if (code <= 82) return { label: "Heavy Rain", icon: CloudRain };
   if (code >= 95) return { label: "Storm", icon: CloudLightning };
   return { label: "Overcast", icon: Cloud };
 };
 
 const getCompassDirection = (degree: number) => {
-  const normalized = ((degree % 360) + 360) % 360;
   const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-  const index = Math.round(normalized / 45) % 8;
-  return directions[index];
+  // Normalize degree to 0-360 before calculating index
+  const normalized = ((degree % 360) + 360) % 360;
+  return directions[Math.round(normalized / 45) % 8];
 };
 
 // --- Custom Hooks ---
 
-const useGeolocation = (options?: PositionOptions) => {
-  const [state, setState] = useState<GeoState>({
-    coords: null,
-    error: null,
-    loading: true,
-  });
-  const stableOptions = useRef(options);
+const useGeolocation = () => {
+  const [state, setState] = useState<GeoState>({ coords: null, error: null, loading: true });
 
   useEffect(() => {
     if (typeof window === 'undefined' || !navigator.geolocation) {
-      setState((s) => ({ ...s, loading: false, error: "Geolocation not supported." }));
+      setState(s => ({ ...s, loading: false, error: "Not supported" }));
       return;
     }
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
-      setState((prev) => {
+      setState(prev => {
+        // Deep comparison to prevent re-renders if data is identical
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
             prev.coords.accuracy === coords.accuracy &&
-            prev.coords.speed === coords.speed) {
+            prev.coords.speed === coords.speed &&
+            prev.coords.altitude === coords.altitude) {
           return prev;
         }
         return {
@@ -112,17 +97,17 @@ const useGeolocation = (options?: PositionOptions) => {
     const handleError = (error: GeolocationPositionError) => {
       let message = "Unknown error";
       switch (error.code) {
-        case error.PERMISSION_DENIED: message = "GPS access denied."; break;
-        case error.POSITION_UNAVAILABLE: message = "GPS signal lost."; break;
-        case error.TIMEOUT: message = "GPS request timed out."; break;
+        case error.PERMISSION_DENIED: message = "GPS Denied"; break;
+        case error.POSITION_UNAVAILABLE: message = "Signal Lost"; break;
+        case error.TIMEOUT: message = "Timeout"; break;
       }
-      setState((s) => ({ ...s, loading: false, error: message }));
+      setState(s => ({ ...s, loading: false, error: message }));
     };
 
     const watcher = navigator.geolocation.watchPosition(
       handleSuccess,
       handleError,
-      stableOptions.current ?? { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
     );
     return () => navigator.geolocation.clearWatch(watcher);
   }, []);
@@ -131,11 +116,14 @@ const useGeolocation = (options?: PositionOptions) => {
 };
 
 const useCompass = () => {
-  const [visualHeading, setVisualHeading] = useState<number | null>(null);
-  const [trueHeading, setTrueHeading] = useState<number | null>(null);
+  const [heading, setHeading] = useState<number | null>(null);
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const cumulativeRef = useRef(0);
+  
+  // Refs for animation loop
+  const targetHeadingRef = useRef<number>(0);
+  const currentHeadingRef = useRef<number>(0);
+  const rafIdRef = useRef<number | null>(null);
 
   const requestAccess = useCallback(async () => {
     const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission === 'function';
@@ -146,10 +134,10 @@ const useCompass = () => {
           setPermissionGranted(true);
           setError(null);
         } else {
-          setError("Compass denied");
+          setError("Compass Denied");
         }
       } catch (e) {
-        setError("Not supported");
+        setError("Not Supported");
       }
     } else {
       setPermissionGranted(true);
@@ -157,51 +145,64 @@ const useCompass = () => {
     }
   }, []);
 
+  // Animation Loop for Smooth Physics (Lerp)
   useEffect(() => {
     if (!permissionGranted) return;
-    let animationFrameId: number;
-    
-    const handleOrientation = (e: Event) => {
-      const event = e as DeviceOrientationEventiOS;
-      
-      cancelAnimationFrame(animationFrameId);
-      animationFrameId = requestAnimationFrame(() => {
-        let newHeading: number | null = null;
-        
-        if (typeof event.webkitCompassHeading === 'number') {
-          // iOS
-          newHeading = event.webkitCompassHeading;
-        } else if (event.alpha !== null) {
-          // Android: alpha is counter-clockwise. Heading = 360 - alpha
-          newHeading = 360 - event.alpha; 
-        }
 
-        if (newHeading !== null) {
-          const normalized = (newHeading + 360) % 360;
-          setTrueHeading(normalized);
-
-          // Interpolation to prevent spinning when crossing 360->0
-          let delta = normalized - (cumulativeRef.current % 360);
-          if (delta > 180) delta -= 360;
-          if (delta < -180) delta += 360;
-          
-          cumulativeRef.current += delta;
-          setVisualHeading(cumulativeRef.current);
-        }
-      });
+    const animate = () => {
+      // Linear Interpolation: Move 15% closer to target per frame
+      const diff = targetHeadingRef.current - currentHeadingRef.current;
+      if (Math.abs(diff) > 0.1) {
+        currentHeadingRef.current += diff * 0.15; 
+        setHeading(currentHeadingRef.current);
+      }
+      rafIdRef.current = requestAnimationFrame(animate);
     };
+    animate();
 
-    const win = window as any;
-    const eventName = 'ondeviceorientationabsolute' in win ? 'deviceorientationabsolute' : 'deviceorientation';
-    
-    window.addEventListener(eventName, handleOrientation, true);
     return () => {
-      window.removeEventListener(eventName, handleOrientation, true);
-      cancelAnimationFrame(animationFrameId);
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
     };
   }, [permissionGranted]);
 
-  return { visualHeading, trueHeading, requestAccess, permissionGranted, error };
+  // Event Listener
+  useEffect(() => {
+    if (!permissionGranted) return;
+
+    const handleOrientation = (e: any) => {
+      let newHeading: number | null = null;
+      
+      if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
+        newHeading = e.webkitCompassHeading; // iOS
+      } else if (e.alpha !== null) {
+        newHeading = 360 - e.alpha; // Android
+      }
+
+      if (newHeading !== null) {
+        // Shortest path logic for rotation
+        const current = targetHeadingRef.current;
+        const delta = newHeading - (current % 360);
+        
+        // Normalize delta to be between -180 and 180
+        let shortestDelta = ((delta + 180) % 360) - 180;
+        if (shortestDelta < -180) shortestDelta += 360;
+
+        targetHeadingRef.current = current + shortestDelta;
+      }
+    };
+
+    const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
+    window.addEventListener(eventName, handleOrientation, true);
+    return () => window.removeEventListener(eventName, handleOrientation, true);
+  }, [permissionGranted]);
+
+  return { 
+    heading, // This is the smoothed visual value
+    trueHeading: targetHeadingRef.current, // This is the raw target
+    requestAccess, 
+    permissionGranted, 
+    error 
+  };
 };
 
 const useDebounce = <T,>(value: T, delay: number): T => {
@@ -214,6 +215,46 @@ const useDebounce = <T,>(value: T, delay: number): T => {
 };
 
 // --- UI Components ---
+
+// Memoized Compass Lines for performance
+const CompassTicks = memo(() => (
+  <>
+    {/* Outer Ring */}
+    <circle cx="50" cy="50" r="48" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/10 fill-none" />
+    
+    {[...Array(60)].map((_, i) => {
+       const isCardinal = i % 15 === 0; // N, E, S, W
+       const isMajor = i % 5 === 0;  
+       const length = isCardinal ? 10 : isMajor ? 7 : 4;
+       const width = isCardinal ? 1.5 : isMajor ? 1 : 0.5;
+       const colorClass = isCardinal ? "text-foreground" : isMajor ? "text-foreground/60" : "text-muted-foreground/30";
+       
+       return (
+          <line 
+            key={i} 
+            x1="50" y1="6" 
+            x2="50" y2={6 + length} 
+            transform={`rotate(${i * 6} 50 50)`} 
+            stroke="currentColor" 
+            strokeWidth={width} 
+            className={colorClass}
+            strokeLinecap="round"
+          />
+       )
+    })}
+    {/* Labels */}
+    <text x="50" y="28" textAnchor="middle" className="text-[7px] font-black fill-red-500" transform="rotate(0 50 50)">N</text>
+    <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(90 50 50)">E</text>
+    <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(180 50 50)">S</text>
+    <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(270 50 50)">W</text>
+    
+    {/* Center Decoration */}
+    <circle cx="50" cy="50" r="1.5" className="fill-foreground/20" />
+    <line x1="40" y1="50" x2="60" y2="50" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
+    <line x1="50" y1="40" x2="50" y2="60" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
+  </>
+));
+CompassTicks.displayName = "CompassTicks";
 
 const CompassDisplay = memo(({ 
   heading, 
@@ -229,91 +270,53 @@ const CompassDisplay = memo(({
   permissionGranted: boolean 
 }) => {
   
-  // Rotate the CARD/DIAL, not the needle. 
-  // If heading is 90 (East), dial rotates -90 so "E" is at the top.
   const rotation = heading ? -heading : 0;
+  const normalizedHeading = trueHeading ? ((trueHeading % 360) + 360) % 360 : 0;
   const directionStr = trueHeading ? getCompassDirection(trueHeading) : "--";
 
   return (
-    <div className="flex flex-col items-center justify-center mb-6 relative z-10 animate-in zoom-in-50 duration-700">
-      
-      {/* Clickable Compass Area */}
+    <div className="flex flex-col items-center justify-center mb-4 relative z-10 animate-in zoom-in-50 duration-700 fade-in">
       <div 
         className="relative w-72 h-72 md:w-80 md:h-80 cursor-pointer group tap-highlight-transparent"
         onClick={onClick}
       >
-         {/* Fixed Top Marker (Device Heading Indicator) */}
-         <div className="absolute top-0 left-1/2 -translate-x-1/2 z-20">
-             <div className="w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[10px] border-t-accent drop-shadow-md" />
+         {/* Fixed Top Marker (The actual needle pointer) */}
+         <div className="absolute top-0 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
+             <div className="w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[10px] border-t-red-500/80 drop-shadow-lg filter blur-[0.2px]" />
          </div>
 
          {/* The Rotating Dial */}
          <div 
-            className="w-full h-full will-change-transform transition-transform duration-500 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
+            className="w-full h-full will-change-transform"
             style={{ transform: `rotate(${rotation}deg)` }}
          >
            <svg viewBox="0 0 100 100" className="w-full h-full select-none pointer-events-none">
-              
-              {/* Ticks */}
-              {[...Array(60)].map((_, i) => {
-                 const isMajor = i % 15 === 0; // N, E, S, W
-                 const isMinor = i % 5 === 0;  
-                 const length = isMajor ? 12 : isMinor ? 7 : 4;
-                 const width = isMajor ? 1.5 : isMinor ? 0.8 : 0.4;
-                 const colorClass = isMajor ? "text-foreground" : "text-muted-foreground/40";
-                 
-                 return (
-                    <line 
-                      key={i} 
-                      x1="50" y1="5" 
-                      x2="50" y2={5 + length} 
-                      transform={`rotate(${i * 6} 50 50)`} 
-                      stroke="currentColor" 
-                      strokeWidth={width} 
-                      className={colorClass}
-                    />
-                 )
-              })}
-              
-              {/* Labels (Oriented to center) */}
-              {/* North */}
-              <text x="50" y="26" textAnchor="middle" className="text-[8px] font-black fill-red-500" transform="rotate(0 50 50)">N</text>
-              {/* East */}
-              <text x="50" y="26" textAnchor="middle" className="text-[7px] font-bold fill-foreground" transform="rotate(90 50 50)">E</text>
-              {/* South */}
-              <text x="50" y="26" textAnchor="middle" className="text-[7px] font-bold fill-foreground" transform="rotate(180 50 50)">S</text>
-              {/* West */}
-              <text x="50" y="26" textAnchor="middle" className="text-[7px] font-bold fill-foreground" transform="rotate(270 50 50)">W</text>
-
-              {/* Center Crosshair (Fixed to dial) */}
-              <circle cx="50" cy="50" r="1.5" className="fill-muted-foreground/50" />
-              <line x1="45" y1="50" x2="55" y2="50" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
-              <line x1="50" y1="45" x2="50" y2="55" stroke="currentColor" strokeWidth="0.2" className="text-muted-foreground/30" />
+              <CompassTicks />
            </svg>
          </div>
 
          {/* Call to Action Overlay */}
          {!permissionGranted && !hasError && (
-             <div className="absolute inset-0 flex items-center justify-center rounded-full z-30">
-                <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground animate-pulse bg-background/50 backdrop-blur-sm px-4 py-2 rounded-full border border-border/20">
-                   Tap to Activate
-                </span>
+             <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-background/5 backdrop-blur-[1px]">
+                <button className="text-[10px] font-bold uppercase tracking-[0.2em] text-foreground/80 animate-pulse bg-background/80 backdrop-blur-md px-6 py-3 rounded-full border border-border/40 shadow-xl hover:scale-105 transition-transform">
+                   Tap to Align
+                </button>
              </div>
          )}
          {hasError && (
-            <div className="absolute inset-0 flex items-center justify-center z-30">
-                <AlertCircle className="w-8 h-8 text-destructive/80" />
+            <div className="absolute inset-0 flex items-center justify-center z-30 bg-background/50 backdrop-blur-sm rounded-full">
+                <AlertCircle className="w-10 h-10 text-destructive/80" />
             </div>
          )}
       </div>
 
       {/* Digital Heading */}
-      <div className="mt-2 flex flex-col items-center">
-        <div className="text-6xl font-mono font-black tracking-tighter tabular-nums text-foreground">
-          {trueHeading !== null ? trueHeading.toFixed(0) : "--"}°
+      <div className="mt-4 flex flex-col items-center">
+        <div className="text-6xl font-mono font-black tracking-tighter tabular-nums text-foreground select-all">
+          {permissionGranted ? normalizedHeading.toFixed(0) : "--"}°
         </div>
-        <div className="text-sm font-bold text-muted-foreground tracking-[0.4em] uppercase mt-2">
-          {directionStr}
+        <div className="text-sm font-bold text-muted-foreground/60 tracking-[0.5em] uppercase mt-2">
+          {permissionGranted ? directionStr : "---"}
         </div>
       </div>
     </div>
@@ -326,25 +329,25 @@ const CoordinateDisplay = memo(({ label, value, type }: { label: string; value: 
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
+    if (navigator.clipboard?.writeText) {
       try { 
         await navigator.clipboard.writeText(formattedValue); 
         setCopied(true);
-        setTimeout(() => setCopied(false), 1000);
+        setTimeout(() => setCopied(false), 2000);
       } catch (e) { }
     }
   };
 
   return (
     <div 
-      className="group cursor-pointer flex flex-col items-center justify-center transition-all duration-200 hover:opacity-80 active:scale-95"
+      className="group cursor-pointer flex flex-col items-center justify-center transition-all duration-200 hover:opacity-70 active:scale-95"
       onClick={handleCopy}
     >
-      <span className={`text-[10px] uppercase tracking-[0.25em] mb-1 font-bold select-none transition-colors ${copied ? "text-accent" : "text-muted-foreground"}`}>
-        {copied ? "COPIED" : label}
+      <span className={`text-[9px] uppercase tracking-[0.25em] mb-2 font-bold select-none transition-colors duration-300 ${copied ? "text-green-500" : "text-muted-foreground"}`}>
+        {copied ? "COPIED TO CLIPBOARD" : label}
       </span>
       <span 
-        className={`text-3xl md:text-5xl lg:text-6xl font-black tracking-tighter font-mono transition-colors duration-300 select-all whitespace-nowrap ${copied ? "text-accent" : "text-foreground"}`}
+        className={`text-3xl md:text-5xl lg:text-6xl font-black tracking-tighter font-mono tabular-nums transition-colors duration-300 select-all whitespace-nowrap ${copied ? "text-green-500" : "text-foreground"}`}
       >
         {formattedValue}
       </span>
@@ -354,12 +357,12 @@ const CoordinateDisplay = memo(({ label, value, type }: { label: string; value: 
 CoordinateDisplay.displayName = "CoordinateDisplay";
 
 const StatMinimal = ({ icon: Icon, label, value }: { icon: any, label: string, value: string }) => (
-    <div className="flex flex-col items-center justify-center min-w-[80px]">
-        <div className="flex items-center gap-1.5 text-muted-foreground mb-1">
-            <Icon className="w-3 h-3 opacity-70" />
-            <span className="text-[9px] uppercase tracking-widest font-semibold">{label}</span>
+    <div className="flex flex-col items-center justify-center min-w-[80px] p-2 rounded-lg hover:bg-muted/30 transition-colors">
+        <div className="flex items-center gap-1.5 text-muted-foreground mb-1.5">
+            <Icon className="w-3 h-3 opacity-60" />
+            <span className="text-[9px] uppercase tracking-widest font-bold opacity-80">{label}</span>
         </div>
-        <span className="text-lg font-mono font-bold text-foreground/90">
+        <span className="text-lg font-mono font-bold text-foreground/90 tabular-nums">
             {value}
         </span>
     </div>
@@ -367,11 +370,13 @@ const StatMinimal = ({ icon: Icon, label, value }: { icon: any, label: string, v
 
 export default function GeoLocation() {
   const { coords, error, loading } = useGeolocation();
-  const { visualHeading, trueHeading, requestAccess, permissionGranted, error: compassError } = useCompass();
+  const { heading, trueHeading, requestAccess, permissionGranted, error: compassError } = useCompass();
   const [address, setAddress] = useState<string | null>(null);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [isCtxLoading, setIsCtxLoading] = useState(false);
-  const debouncedCoords = useDebounce(coords, 1200);
+  
+  // Increase debounce time to avoid API rate limits when moving rapidly
+  const debouncedCoords = useDebounce(coords, 2500);
 
   useEffect(() => {
     if (!debouncedCoords) return;
@@ -380,18 +385,28 @@ export default function GeoLocation() {
 
     const fetchData = async () => {
       try {
+        const { latitude, longitude } = debouncedCoords;
         const [geoRes, weatherRes] = await Promise.allSettled([
-          fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${debouncedCoords.latitude}&lon=${debouncedCoords.longitude}`, { signal: controller.signal }),
-          fetch(`https://api.open-meteo.com/v1/forecast?latitude=${debouncedCoords.latitude}&longitude=${debouncedCoords.longitude}&current=temperature_2m,weather_code&timezone=auto`, { signal: controller.signal })
+          fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=14`, { signal: controller.signal }),
+          fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code&timezone=auto`, { signal: controller.signal })
         ]);
 
         if (geoRes.status === 'fulfilled' && geoRes.value.ok) {
           const data = await geoRes.value.json();
           const addr = data.address;
           if (addr) {
-            const city = addr.city || addr.town || addr.village || addr.county || addr.suburb || "";
-            const country = addr.country || "";
-            setAddress([city, country].filter(Boolean).join(', '));
+            // Prioritize specific locality names
+            const locationStr = [
+               addr.city, 
+               addr.town, 
+               addr.village, 
+               addr.hamlet,
+               addr.county,
+               addr.state 
+            ].find(val => val && val.length > 0) || "Unknown Location";
+            
+            const countryStr = addr.country_code ? addr.country_code.toUpperCase() : "";
+            setAddress(countryStr ? `${locationStr}, ${countryStr}` : locationStr);
           }
         }
 
@@ -400,27 +415,26 @@ export default function GeoLocation() {
           const info = getWeatherInfo(data.current.weather_code);
           setWeather({ temp: data.current.temperature_2m, code: data.current.weather_code, description: info.label });
         }
-      } catch (err) { } finally { setIsCtxLoading(false); }
+      } catch (err) {
+        // Silent catch for aborts
+      } finally { 
+        setIsCtxLoading(false); 
+      }
     };
+    
     fetchData();
     return () => controller.abort();
   }, [debouncedCoords]);
 
   const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
 
-  const openMaps = () => {
-    if (coords) {
-        window.open(`https://www.google.com/maps/search/?api=1&query=${coords.latitude},${coords.longitude}`, '_blank');
-    }
-  };
-
   return (
-    <main className="flex flex-col items-center justify-center min-h-screen bg-background text-foreground p-4 py-8 overflow-x-hidden">
-      <div className="w-full max-w-7xl flex flex-col items-center justify-start space-y-12">
+    <main className="flex flex-col items-center justify-center min-h-screen bg-background text-foreground p-4 overflow-hidden touch-manipulation select-none">
+      <div className="w-full max-w-7xl flex flex-col items-center justify-start space-y-8 md:space-y-12 pb-10">
         
         {/* Floating Rotating Compass */}
         <CompassDisplay 
-          heading={visualHeading}
+          heading={heading}
           trueHeading={trueHeading}
           onClick={requestAccess} 
           hasError={!!compassError}
@@ -428,61 +442,70 @@ export default function GeoLocation() {
         />
 
         {loading && !coords && (
-          <div className="animate-pulse flex flex-col items-center space-y-4">
-            <RefreshCcw className="w-4 h-4 animate-spin text-muted-foreground" />
-            <span className="text-[10px] tracking-widest uppercase text-muted-foreground">Locating...</span>
+          <div className="animate-pulse flex flex-col items-center space-y-4 pt-10">
+            <RefreshCcw className="w-5 h-5 animate-spin text-muted-foreground/60" />
+            <span className="text-[10px] tracking-[0.2em] uppercase text-muted-foreground font-medium">Acquiring Satellites</span>
           </div>
         )}
 
         {error && !coords && (
-          <Alert variant="destructive" className="max-w-md bg-transparent border-destructive/20 text-center p-2">
-             <AlertTitle className="text-sm">Location Error</AlertTitle>
-             <AlertDescription className="text-xs">{error}</AlertDescription>
+          <Alert variant="destructive" className="max-w-xs bg-transparent border border-destructive/30 text-center p-4 backdrop-blur-sm">
+             <AlertTitle className="text-sm font-bold uppercase tracking-widest mb-1">Location Error</AlertTitle>
+             <AlertDescription className="text-xs opacity-90">{error}</AlertDescription>
           </Alert>
         )}
 
         {coords && (
-          <div className="w-full flex flex-col items-center gap-10 animate-fade-in">
+          <div className="w-full flex flex-col items-center gap-8 md:gap-12 animate-in slide-in-from-bottom-4 fade-in duration-700">
+            
             {/* Coordinates */}
             <div className="flex flex-col xl:flex-row gap-8 xl:gap-24 items-center justify-center text-center">
               <CoordinateDisplay label="Latitude" value={coords.latitude} type="lat" />
-              <div className="hidden xl:block h-12 w-px bg-border/30" />
+              <div className="hidden xl:block h-16 w-px bg-border/40" />
               <CoordinateDisplay label="Longitude" value={coords.longitude} type="lng" />
             </div>
 
-            {/* Stats (Minimal, No Boxes) */}
-            <div className="flex gap-12 border-t border-border/20 pt-6">
+            {/* Stats */}
+            <div className="flex flex-wrap justify-center gap-6 md:gap-16 border-t border-border/20 pt-8 w-full max-w-2xl">
                 {coords.altitude !== null && (
-                    <StatMinimal icon={Mountain} label="Alt" value={`${Math.round(coords.altitude)}m`} />
+                    <StatMinimal icon={Mountain} label="Alt" value={`${Math.round(coords.altitude)} m`} />
                 )}
-                {coords.speed !== null && coords.speed > 0 && (
-                    <StatMinimal icon={Activity} label="Spd" value={`${(coords.speed * 3.6).toFixed(1)} km/h`} />
-                )}
-                {coords.accuracy && (
-                    <StatMinimal icon={Navigation} label="Acc" value={`±${coords.accuracy.toFixed(0)}m`} />
-                )}
+                <StatMinimal 
+                    icon={Activity} 
+                    label="Spd" 
+                    value={coords.speed ? `${(coords.speed * 3.6).toFixed(1)} km/h` : '0.0 km/h'} 
+                />
+                <StatMinimal 
+                    icon={Navigation} 
+                    label="Acc" 
+                    value={coords.accuracy ? `±${coords.accuracy.toFixed(0)} m` : '--'} 
+                />
             </div>
 
             {/* Footer Context (Address & Weather) */}
-            <div className="w-full flex flex-col items-center gap-4">
-              {/* Address */}
+            <div className="w-full flex flex-col items-center gap-3 mt-2">
               <button 
-                onClick={openMaps}
-                className="group flex items-center gap-2 text-muted-foreground hover:text-foreground transition-colors"
+                onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${coords.latitude},${coords.longitude}`, '_blank')}
+                className="group flex items-center gap-2.5 text-muted-foreground hover:text-foreground transition-all duration-300 px-4 py-2 rounded-full hover:bg-muted/30"
               >
-                <MapPin className="w-3.5 h-3.5 text-accent group-hover:scale-110 transition-transform" />
-                <span className={`text-lg font-light tracking-wide text-center group-hover:underline underline-offset-4 decoration-dotted ${isCtxLoading ? 'opacity-50' : 'opacity-100'}`}>
-                  {address || "Unknown Location"}
-                </span>
+                <MapPin className="w-4 h-4 text-red-500/80 group-hover:scale-110 transition-transform" />
+                
+                {/* Address Skeleton Loader */}
+                {(!address && isCtxLoading) ? (
+                   <div className="h-4 w-32 bg-muted-foreground/10 animate-pulse rounded" />
+                ) : (
+                   <span className="text-lg font-light tracking-wide text-center">
+                     {address || "Unknown Location"}
+                   </span>
+                )}
               </button>
 
-              {/* Weather */}
               {weather && (
-                  <div className="flex items-center gap-3 text-muted-foreground/70">
+                  <div className="flex items-center gap-3 text-muted-foreground/60 px-4 py-1.5 rounded-full border border-transparent bg-muted/10 backdrop-blur-sm">
                     <WeatherIcon className="w-4 h-4" />
-                    <span className="text-sm font-medium text-foreground">{weather.temp.toFixed(0)}°</span>
-                    <span className="w-px h-3 bg-border" />
-                    <span className="text-xs uppercase tracking-wider">{weather.description}</span>
+                    <span className="text-sm font-medium text-foreground tabular-nums">{weather.temp.toFixed(0)}°</span>
+                    <span className="w-px h-3 bg-border/60" />
+                    <span className="text-[10px] uppercase tracking-wider font-bold">{weather.description}</span>
                   </div>
               )}
             </div>
