@@ -1,9 +1,36 @@
-import type {Metadata} from 'next';
+import type { Metadata, Viewport } from 'next';
+import { Inter } from 'next/font/google';
 import './globals.css';
+
+// Using next/font is better for offline mode as it bundles the font
+const inter = Inter({ 
+  subsets: ['latin'],
+  variable: '--font-inter',
+  display: 'swap',
+});
 
 export const metadata: Metadata = {
   title: 'GeoTrack Now',
   description: 'A minimalist, real-time GPS coordinates display app.',
+  manifest: '/manifest.json',
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: 'black-translucent',
+    title: 'GeoTrack Now',
+  },
+  icons: {
+    apple: [
+      { url: 'https://placehold.co/180x180/09090b/ef4444.png?text=GPS' },
+    ],
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: '#09090b', // Matches zinc-950
+  width: 'device-width',
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false, // Prevents accidental zooming while using the compass
 };
 
 export default function RootLayout({
@@ -13,12 +40,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark">
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="true" />
-        <link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet" />
-      </head>
-      <body className="font-body antialiased">{children}</body>
+      <body className={`${inter.variable} font-sans antialiased`}>
+        {children}
+      </body>
     </html>
   );
 }
