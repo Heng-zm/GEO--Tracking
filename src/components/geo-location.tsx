@@ -6,7 +6,8 @@ import {
   Sun, Cloud, CloudRain, CloudLightning, Snowflake, CloudFog, CloudSun,
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
-  Maximize2, X, ExternalLink, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind
+  Maximize2, X, ExternalLink, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
+  Plus, Minus
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -754,12 +755,15 @@ const FullMapDrawer = memo(({
   lng: number 
 }) => {
   
-  const bbox = useMemo(() => {
-    const d = 0.005; 
-    return `${lng - d},${lat - d},${lng + d},${lat + d}`;
-  }, [lat, lng]);
+  const [viewZoom, setViewZoom] = useState(15);
+  const [imgLoaded, setImgLoaded] = useState(false);
 
-  const embedUrl = `https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat},${lng}`;
+  // Generate Mapbox Static URL with Pin Overlay
+  // Using satellite-streets-v12 style to match the rest of the app
+  // Overlay: pin-l+ef4444 (large red pin)
+  const mapUrl = useMemo(() => 
+    `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/pin-l+ef4444(${lng},${lat})/${lng},${lat},${viewZoom},0,0/600x800@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
+  [lat, lng, viewZoom]);
 
   const openAppleMaps = () => {
     window.open(`http://maps.apple.com/?q=${lat},${lng}`, '_blank');
@@ -767,6 +771,18 @@ const FullMapDrawer = memo(({
 
   const openGoogleMaps = () => {
     window.open(`https://www.google.com/maps/search/?api=1&query=${lat},${lng}`, '_blank');
+  };
+
+  const handleZoomIn = () => {
+    triggerHaptic();
+    setViewZoom(prev => Math.min(prev + 1, 20));
+    setImgLoaded(false);
+  };
+
+  const handleZoomOut = () => {
+    triggerHaptic();
+    setViewZoom(prev => Math.max(prev - 1, 2));
+    setImgLoaded(false);
   };
 
   return (
@@ -785,14 +801,24 @@ const FullMapDrawer = memo(({
 
         {/* Map Header */}
         <div className="absolute top-4 left-6 z-[53] pointer-events-none">
-            <h3 className="text-lg font-bold text-foreground/80">Location Map</h3>
+            <h3 className="text-lg font-bold text-foreground/80 drop-shadow-md">Satellite View</h3>
             <p className="text-xs text-muted-foreground font-mono">{lat.toFixed(4)}, {lng.toFixed(4)}</p>
         </div>
 
         {/* Controls Overlay */}
         <div className="absolute top-4 right-4 z-[53] flex flex-col gap-2">
-           <button onClick={onClose} className="p-3 rounded-full bg-muted/80 backdrop-blur-md border border-border/20 text-foreground active:scale-95 transition-transform" aria-label="Close Map">
+           <button onClick={onClose} className="p-3 rounded-full bg-black/40 backdrop-blur-md border border-white/10 text-white active:scale-95 transition-transform" aria-label="Close Map">
               <X className="w-5 h-5" />
+           </button>
+        </div>
+
+        {/* Zoom Controls */}
+        <div className="absolute top-1/2 right-4 -translate-y-1/2 z-[53] flex flex-col gap-2">
+           <button onClick={handleZoomIn} className="p-3 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-white active:scale-95 transition-transform shadow-lg">
+              <Plus className="w-5 h-5" />
+           </button>
+           <button onClick={handleZoomOut} className="p-3 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-white active:scale-95 transition-transform shadow-lg">
+              <Minus className="w-5 h-5" />
            </button>
         </div>
 
@@ -806,24 +832,23 @@ const FullMapDrawer = memo(({
             </button>
         </div>
 
-        <div className="w-full h-full rounded-t-3xl overflow-hidden relative bg-muted mt-0 pt-0">
+        <div className="w-full h-full rounded-t-3xl overflow-hidden relative bg-[#1a1a1a] mt-0 pt-0">
           {isOpen && (
-             <iframe
-               title="OpenStreetMap"
-               width="100%"
-               height="100%"
-               frameBorder="0"
-               scrolling="no"
-               marginHeight={0}
-               marginWidth={0}
-               src={embedUrl}
-               className="w-full h-full filter contrast-[1.1] brightness-[0.95] grayscale-[0.2]"
-               allow="geolocation"
+             <img
+               src={mapUrl}
+               alt="Mapbox Satellite View"
+               onLoad={() => setImgLoaded(true)}
+               className={`w-full h-full object-cover transition-opacity duration-500 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+               style={{ filter: 'grayscale(0.2) contrast(1.1) brightness(0.9)' }}
              />
           )}
           <div className="absolute inset-0 flex items-center justify-center -z-10">
              <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
           </div>
+          
+          {/* Map Grid Overlay for aesthetics */}
+          <div className="absolute inset-0 pointer-events-none opacity-20"
+               style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '100px 100px' }} />
         </div>
       </div>
     </>
