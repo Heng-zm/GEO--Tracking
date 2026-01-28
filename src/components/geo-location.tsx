@@ -54,7 +54,7 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 const triggerHaptic = () => {
   try {
     if (typeof navigator !== 'undefined' && navigator.vibrate) {
-      navigator.vibrate(10);
+      navigator.vibrate(15);
     }
   } catch (e) {}
 };
@@ -349,59 +349,79 @@ const RadarMapbox = memo(({
   const markerRotation = mode === 'heading-up' ? 0 : heading;
 
   return (
-    // Scaled down to w-60 (15rem) on mobile to fix overflow
     <div className="relative w-60 h-60 md:w-80 md:h-80 shrink-0 transition-all duration-300">
-      <div className="absolute inset-0 rounded-full border border-border/20 bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
-      <div className="w-full h-full rounded-full border-4 border-muted/20 bg-black overflow-hidden relative isolate">
+      <div className="absolute inset-0 rounded-full bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
+      
+      {/* 
+         FIX: Separation of concerns. 
+         1. The container defines the shape.
+         2. The inner div (absolute) handles the mask and clipping.
+         3. The border sits ON TOP (absolute) so it isn't clipped by the mask.
+      */}
+      <div className="w-full h-full relative isolate">
         
-        {/* Map Container - Rotates */}
+        {/* CLIPPING CONTAINER - This enforces the circle shape on the map */}
         <div 
-          className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear"
-          style={{ transform: `rotate(${-rotation}deg)` }}
+          className="absolute inset-0 rounded-full overflow-hidden bg-black z-0"
+          style={{ 
+             // This is the key fix for mobile browsers: Strict masking
+             WebkitMaskImage: '-webkit-radial-gradient(white, black)',
+             maskImage: 'radial-gradient(white, black)',
+             transform: 'translateZ(0)' // Force GPU layer
+          }}
         >
-          {/* Tile Layer */}
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[220%] h-[220%]">
-             <div className="absolute inset-0 bg-[#0a0f0a]" />
-             
-             {/* Tactical Grid Fallback */}
-             <div className={`absolute inset-0 opacity-15 transition-opacity duration-300 ${(!imgLoaded || mapError) ? 'opacity-30' : ''}`}
-               style={{ 
-                 backgroundImage: 'linear-gradient(#22c55e 1px, transparent 1px), linear-gradient(90deg, #22c55e 1px, transparent 1px)', 
-                 backgroundSize: '40px 40px' 
-               }} 
-             />
-             
-             {!mapError && (
-               <img
-                 src={mapUrl}
-                 alt="Satellite View"
-                 onLoad={() => setImgLoaded(true)}
-                 onError={() => setMapError(true)}
-                 className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
-                 style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.8)' }}
+          {/* Rotating Map Layer */}
+          <div 
+            className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear origin-center"
+            style={{ transform: `rotate(${-rotation}deg) scale(1.02)` }} // Scale slightly to avoid subpixel bleeding
+          >
+            {/* Tile Layer */}
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[220%] h-[220%]">
+               <div className="absolute inset-0 bg-[#0a0f0a]" />
+               
+               {/* Grid Fallback */}
+               <div className={`absolute inset-0 opacity-15 transition-opacity duration-300 ${(!imgLoaded || mapError) ? 'opacity-30' : ''}`}
+                 style={{ 
+                   backgroundImage: 'linear-gradient(#22c55e 1px, transparent 1px), linear-gradient(90deg, #22c55e 1px, transparent 1px)', 
+                   backgroundSize: '40px 40px' 
+                 }} 
                />
-             )}
-          </div>
+               
+               {!mapError && (
+                 <img
+                   src={mapUrl}
+                   alt="Satellite View"
+                   onLoad={() => setImgLoaded(true)}
+                   onError={() => setMapError(true)}
+                   className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+                   style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.8)' }}
+                 />
+               )}
+            </div>
 
-          {/* User Trail & Marker */}
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
-            <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
-              {svgPath && (
-                <path d={svgPath} fill="none" stroke="#22c55e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="opacity-60 drop-shadow-[0_0_8px_rgba(34,197,94,0.6)]" />
-              )}
-              <g transform={`translate(${userX}, ${userY})`}>
-                 <g transform={`rotate(${markerRotation})`}>
-                    <path d="M -6 -6 L 0 -18 L 6 -6" fill="rgba(34,197,94,0.8)" />
-                    <circle r="5" fill="#22c55e" className="animate-pulse" />
-                    <circle r="8" fill="none" stroke="#ffffff" strokeWidth="2" className="opacity-90" />
-                 </g>
-              </g>
-            </svg>
+            {/* User Trail & Marker */}
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
+              <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
+                {svgPath && (
+                  <path d={svgPath} fill="none" stroke="#22c55e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="opacity-60 drop-shadow-[0_0_8px_rgba(34,197,94,0.6)]" />
+                )}
+                <g transform={`translate(${userX}, ${userY})`}>
+                   <g transform={`rotate(${markerRotation})`}>
+                      <path d="M -6 -6 L 0 -18 L 6 -6" fill="rgba(34,197,94,0.8)" />
+                      <circle r="5" fill="#22c55e" className="animate-pulse" />
+                      <circle r="8" fill="none" stroke="#ffffff" strokeWidth="2" className="opacity-90" />
+                   </g>
+                </g>
+              </svg>
+            </div>
           </div>
         </div>
 
+        {/* BORDER & OVERLAYS - Sit outside the clipped container */}
+        <div className="absolute inset-0 rounded-full border-4 border-muted/20 pointer-events-none z-10" />
+        
         {/* HUD Elements */}
-        <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20" />
+        <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20 rounded-full" />
         <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
         
         {/* Radar Sweep */}
@@ -493,7 +513,6 @@ const CompassDisplay = memo(({
   return (
     <div className="flex flex-col items-center justify-center relative z-10 shrink-0">
       <div 
-        // Scaled down to w-56 for mobile
         className="relative w-56 h-56 md:w-64 md:h-64 cursor-pointer group select-none touch-manipulation transition-all duration-300" 
         onClick={onClick}
         role="button"
@@ -791,7 +810,6 @@ export default function GeoLocation() {
   if (!mounted) return null;
 
   return (
-    // Changed min-h-screen to min-h-[100dvh] for mobile browser address bars
     <main className="relative flex flex-col items-center min-h-[100dvh] w-full bg-[#09090b] text-foreground p-4 md:p-8 overflow-x-hidden touch-manipulation font-sans selection:bg-green-500/30 pb-32">
       
       {/* Background Texture */}
