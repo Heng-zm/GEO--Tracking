@@ -4,7 +4,8 @@ import React, { useState, useEffect, useRef, useMemo, memo, useCallback } from '
 import { 
   Sun, Cloud, CloudRain, CloudLightning, Snowflake, CloudFog, CloudSun,
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
-  Trash2, Crosshair, Compass as CompassIcon, WifiOff
+  Trash2, Crosshair, Compass as CompassIcon, WifiOff,
+  Maximize2, X, ExternalLink, LocateFixed
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -50,6 +51,14 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 }
 
 // --- Helpers ---
+const triggerHaptic = () => {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.vibrate) {
+      navigator.vibrate(15);
+    }
+  } catch (e) {}
+};
+
 const formatCoordinate = (value: number, type: 'lat' | 'lng'): string => {
   const direction = type === 'lat' ? (value >= 0 ? 'N' : 'S') : (value >= 0 ? 'E' : 'W');
   return `${Math.abs(value).toFixed(6)}°${direction}`;
@@ -58,21 +67,21 @@ const formatCoordinate = (value: number, type: 'lat' | 'lng'): string => {
 const convertSpeed = (ms: number | null, system: UnitSystem): string => {
   if (ms === null || ms < 0) return "0.0";
   return system === 'metric' 
-    ? `${(ms * 3.6).toFixed(1)} km/h` 
-    : `${(ms * 2.23694).toFixed(1)} mph`;
+    ? `${(ms * 3.6).toFixed(1)}` 
+    : `${(ms * 2.23694).toFixed(1)}`;
 };
 
 const convertAltitude = (meters: number | null, system: UnitSystem): string => {
   if (meters === null) return "--";
   return system === 'metric'
-    ? `${Math.round(meters)} m`
-    : `${Math.round(meters * 3.28084)} ft`;
+    ? `${Math.round(meters)}`
+    : `${Math.round(meters * 3.28084)}`;
 };
 
 const convertTemp = (celsius: number, system: UnitSystem): string => {
   return system === 'metric'
-    ? `${celsius.toFixed(1)}°C`
-    : `${((celsius * 9/5) + 32).toFixed(1)}°F`;
+    ? `${celsius.toFixed(1)}°`
+    : `${((celsius * 9/5) + 32).toFixed(1)}°`;
 };
 
 const getWeatherInfo = (code: number) => {
@@ -81,7 +90,7 @@ const getWeatherInfo = (code: number) => {
   if (code <= 48) return { label: "Fog", icon: CloudFog };
   if (code <= 67) return { label: "Rain", icon: CloudRain };
   if (code <= 77) return { label: "Snow", icon: Snowflake };
-  if (code <= 82) return { label: "Heavy Rain", icon: CloudRain };
+  if (code <= 82) return { label: "H. Rain", icon: CloudRain };
   if (code >= 95) return { label: "Storm", icon: CloudLightning };
   return { label: "Overcast", icon: Cloud };
 };
@@ -103,15 +112,12 @@ const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => 
   return R * c;
 };
 
-// Precise Web Mercator Projection for Mapbox
-// Converts Lat/Lng to Pixel coordinates relative to the center anchor at specific zoom
 const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: number, zoom: number) => {
-  const TILE_SIZE = 512; // Mapbox static tiles are 512x512 @2x usually, but math works on base 256 logic scaled up
+  const TILE_SIZE = 512; 
   const worldSize = TILE_SIZE * Math.pow(2, zoom);
 
   const project = (lat: number, lng: number) => {
     let siny = Math.sin((lat * Math.PI) / 180);
-    // Truncate to 85.05112878 to avoid singularity at poles
     siny = Math.min(Math.max(siny, -0.9999), 0.9999);
     return {
       x: worldSize * (0.5 + lng / 360),
@@ -126,6 +132,7 @@ const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: num
 };
 
 // --- Hooks ---
+
 const useGeolocation = () => {
   const [state, setState] = useState<GeoState>({ coords: null, error: null, loading: true });
   const lastUpdate = useRef<number>(0);
@@ -138,16 +145,11 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
-      // Throttle: Max 2 updates per second
       if (now - lastUpdate.current < 500) return;
-      
-      // Sanity check for invalid coordinates
       if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
-      
       lastUpdate.current = now;
 
       setState(prev => {
-        // Deep comparison to prevent re-renders on identical data
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
@@ -177,15 +179,13 @@ const useGeolocation = () => {
       switch(error.code) {
         case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
         case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return; // Ignore timeouts, keep last known position
+        case error.TIMEOUT: return;
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
 
     const watcher = navigator.geolocation.watchPosition(
-      handleSuccess, 
-      handleError, 
-      { enableHighAccuracy: true, timeout: 20000, maximumAge: 1000 }
+      handleSuccess, handleError, { enableHighAccuracy: true, timeout: 20000, maximumAge: 1000 }
     );
 
     return () => navigator.geolocation.clearWatch(watcher);
@@ -204,94 +204,69 @@ const useCompass = () => {
   const rafIdRef = useRef<number | null>(null);
   const isAnimating = useRef(false);
 
-  // Auto-grant non-iOS
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission === 'function';
+      const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS)?.requestPermission === 'function';
       if (!isIOS) setPermissionGranted(true);
     }
   }, []);
 
   const requestAccess = useCallback(async () => {
+    triggerHaptic();
+    if (typeof DeviceOrientationEvent === 'undefined') {
+      setError("Sensor not found");
+      return;
+    }
     const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission === 'function';
     if (isIOS) {
       try {
         const response = await (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission!();
-        if (response === 'granted') { 
-          setPermissionGranted(true); 
-          setError(null); 
-        } else { 
-          setError("Denied"); 
-        }
+        if (response === 'granted') { setPermissionGranted(true); setError(null); } else { setError("Denied"); }
       } catch (e) { setError("Not supported"); }
-    } else { 
-      setPermissionGranted(true); 
-    }
+    } else { setPermissionGranted(true); }
   }, []);
 
-  // Optimized Physics Loop
   useEffect(() => {
     if (!permissionGranted) return;
-
     const loop = () => {
-      // If we are close enough, stop the loop to save battery
       const diff = targetRef.current - currentRef.current;
       if (Math.abs(diff) < 0.1) {
          isAnimating.current = false;
-         // Set exact value to stop micro-jitters
          if (currentRef.current !== targetRef.current) {
             currentRef.current = targetRef.current;
             setVisualHeading((currentRef.current % 360 + 360) % 360);
          }
          return;
       }
-
-      // Spring physics (Damping)
       currentRef.current += diff * 0.15;
       setVisualHeading((currentRef.current % 360 + 360) % 360);
       rafIdRef.current = requestAnimationFrame(loop);
     };
+    if (isAnimating.current) rafIdRef.current = requestAnimationFrame(loop);
+    return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
+  }, [permissionGranted, trueHeading]);
 
-    if (isAnimating.current) {
-        rafIdRef.current = requestAnimationFrame(loop);
-    }
-    
-    return () => { 
-      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); 
-    };
-  }, [permissionGranted, trueHeading]); // Re-trigger when trueHeading changes to restart loop
-
-  // Event Listener
   useEffect(() => {
-    if (!permissionGranted) return;
-    
+    if (!permissionGranted || typeof window === 'undefined') return;
     const handleOrientation = (e: any) => {
       let degree: number | null = null;
-      
       if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
         degree = e.webkitCompassHeading;
       } else if (e.alpha !== null) {
         degree = Math.abs(360 - e.alpha);
       }
-      
       if (degree !== null) {
         const normalized = ((degree) + 360) % 360;
         setTrueHeading(normalized);
-        
         const current = targetRef.current;
         const currentMod = (current % 360 + 360) % 360;
         let delta = normalized - currentMod;
-        
-        // Shortest path logic
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
-        
-        // Threshold to start animation
         if (Math.abs(delta) > 0.5) {
           targetRef.current = current + delta;
           if (!isAnimating.current) {
              isAnimating.current = true;
-             // Restart loop
              rafIdRef.current = requestAnimationFrame(() => {
                  const diff = targetRef.current - currentRef.current;
                  currentRef.current += diff * 0.15;
@@ -302,9 +277,7 @@ const useCompass = () => {
         }
       }
     };
-    
-    const win = window as any;
-    const eventName = 'ondeviceorientationabsolute' in win ? 'deviceorientationabsolute' : 'deviceorientation';
+    const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
     window.addEventListener(eventName, handleOrientation, true);
     return () => window.removeEventListener(eventName, handleOrientation, true);
   }, [permissionGranted]);
@@ -345,11 +318,9 @@ const RadarMapbox = memo(({
   const [imgLoaded, setImgLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
 
-  // Update anchor logic
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
     setIsOffCenter(distance > 10);
-    
     if (distance > MAP_UPDATE_THRESHOLD) {
       setAnchor({ lat, lng });
       setImgLoaded(false);
@@ -364,7 +335,6 @@ const RadarMapbox = memo(({
   const { userX, userY, svgPath } = useMemo(() => {
     const userPos = geoToPixels(lat, lng, anchor.lat, anchor.lng, RADAR_ZOOM);
     let pathD = "";
-    
     if (path.length > 1) {
       const points = path.map(p => {
         const pt = geoToPixels(p.lat, p.lng, anchor.lat, anchor.lng, RADAR_ZOOM);
@@ -372,7 +342,6 @@ const RadarMapbox = memo(({
       });
       pathD = "M " + points.join(" L ");
     }
-    
     return { userX: userPos.x, userY: userPos.y, svgPath: pathD };
   }, [lat, lng, anchor, path]);
 
@@ -380,106 +349,100 @@ const RadarMapbox = memo(({
   const markerRotation = mode === 'heading-up' ? 0 : heading;
 
   return (
-    <div className="relative w-64 h-64 md:w-72 md:h-72">
-      <div className="w-full h-full rounded-full border-2 border-border/40 bg-black overflow-hidden shadow-[0_0_30px_rgba(0,0,0,0.6)] group relative isolate">
+    <div className="relative w-72 h-72 lg:w-96 lg:h-96 shrink-0">
+      <div className="absolute inset-0 rounded-full border border-border/20 bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
+      <div className="w-full h-full rounded-full border-4 border-muted/20 bg-black overflow-hidden relative isolate">
         
-        {/* Map Container */}
+        {/* Map Container - Rotates */}
         <div 
           className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear"
           style={{ transform: `rotate(${-rotation}deg)` }}
         >
-          {/* Map Image / Fallback Grid */}
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%]">
-             <div className="absolute inset-0 bg-[#0c100c]" />
+          {/* Tile Layer */}
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[220%] h-[220%]">
+             <div className="absolute inset-0 bg-[#0a0f0a]" />
              
-             {(!imgLoaded || mapError) && (
-               <div className="absolute inset-0 opacity-20" 
-                 style={{ 
-                   backgroundImage: 'radial-gradient(circle, #22c55e 1px, transparent 1px)', 
-                   backgroundSize: '30px 30px' 
-                 }} 
-               />
-             )}
-
+             {/* Tactical Grid Fallback */}
+             <div className={`absolute inset-0 opacity-15 transition-opacity duration-300 ${(!imgLoaded || mapError) ? 'opacity-30' : ''}`}
+               style={{ 
+                 backgroundImage: 'linear-gradient(#22c55e 1px, transparent 1px), linear-gradient(90deg, #22c55e 1px, transparent 1px)', 
+                 backgroundSize: '40px 40px' 
+               }} 
+             />
+             
              {!mapError && (
                <img
                  src={mapUrl}
                  alt="Satellite View"
                  onLoad={() => setImgLoaded(true)}
                  onError={() => setMapError(true)}
-                 className={`w-full h-full object-contain transition-opacity duration-500 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
-                 style={{ filter: 'brightness(0.7) contrast(1.2) sepia(0.15)' }}
+                 className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+                 style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.8)' }}
                />
              )}
           </div>
 
-          {/* SVG Overlay */}
+          {/* User Trail & Marker */}
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
             <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
               {svgPath && (
-                <path 
-                  d={svgPath} 
-                  fill="none" 
-                  stroke="#22c55e" 
-                  strokeWidth="3" 
-                  strokeLinecap="round" 
-                  strokeLinejoin="round"
-                  className="opacity-70 drop-shadow-[0_0_4px_rgba(34,197,94,0.5)]" 
-                />
+                <path d={svgPath} fill="none" stroke="#22c55e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="opacity-60 drop-shadow-[0_0_8px_rgba(34,197,94,0.6)]" />
               )}
-              
               <g transform={`translate(${userX}, ${userY})`}>
                  <g transform={`rotate(${markerRotation})`}>
-                    <path d="M -8 -8 L 0 -24 L 8 -8" fill="rgba(34,197,94,0.3)" />
-                    <circle r="6" fill="#22c55e" className="animate-pulse" />
-                    <circle r="9" fill="none" stroke="#ffffff" strokeWidth="2" />
+                    <path d="M -6 -6 L 0 -18 L 6 -6" fill="rgba(34,197,94,0.8)" />
+                    <circle r="5" fill="#22c55e" className="animate-pulse" />
+                    <circle r="8" fill="none" stroke="#ffffff" strokeWidth="2" className="opacity-90" />
                  </g>
               </g>
             </svg>
           </div>
         </div>
 
-        {/* Radar Sweep Animation */}
+        {/* HUD Elements (Static relative to device) */}
+        <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20" />
+        <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
+        
+        {/* Radar Sweep */}
         <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden z-20">
-             <div className="absolute inset-0 bg-[conic-gradient(from_0deg,transparent_0deg,transparent_270deg,rgba(34,197,94,0.2)_360deg)] animate-[spin_4s_linear_infinite]" />
+             <div className="absolute inset-0 bg-[conic-gradient(from_0deg,transparent_0deg,transparent_280deg,rgba(34,197,94,0.15)_360deg)] animate-[spin_4s_linear_infinite]" />
         </div>
 
-        {/* Static Bezel */}
-        <div className="absolute inset-0 pointer-events-none rounded-full border border-green-500/30 z-30">
-          <div className="absolute top-1/2 left-0 w-full h-[1px] bg-green-500/15" />
-          <div className="absolute top-0 left-1/2 h-full w-[1px] bg-green-500/15" />
-          <div className="absolute inset-0 rounded-full bg-[radial-gradient(circle,transparent_55%,rgba(0,0,0,0.85)_100%)]" />
-          
-          <div 
-            className="absolute inset-0 pointer-events-none transition-transform duration-100 ease-linear"
-            style={{ transform: `rotate(${-rotation}deg)` }}
-          >
-            <div className="absolute top-2 left-1/2 -translate-x-1/2 text-[9px] font-black text-red-500 drop-shadow-lg">N</div>
-          </div>
+        {/* Reticle / Bezel */}
+        <div className="absolute inset-0 pointer-events-none z-30">
+           {/* Center Crosshair */}
+           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 opacity-50">
+              <div className="absolute top-1/2 left-0 w-2 h-px bg-green-500" />
+              <div className="absolute top-1/2 right-0 w-2 h-px bg-green-500" />
+              <div className="absolute top-0 left-1/2 h-2 w-px bg-green-500" />
+              <div className="absolute bottom-0 left-1/2 h-2 w-px bg-green-500" />
+           </div>
+
+          {/* North Indicator */}
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 text-[10px] font-black text-red-500 bg-black/50 px-2 rounded-full backdrop-blur-sm border border-red-500/30"
+               style={{ transform: `rotate(${-rotation}deg)`, transformOrigin: 'center 138px' }}>N</div>
         </div>
         
         {imgLoaded && !mapError && (
-          <div className="absolute bottom-1 right-3 text-[7px] text-white/40 z-30 pointer-events-none">© Mapbox</div>
+          <div className="absolute bottom-3 right-4 text-[8px] font-black tracking-widest text-white/40 z-30 font-mono">SAT FEED</div>
         )}
 
         <button
-           onClick={onToggleMode}
+           onClick={() => { triggerHaptic(); onToggleMode(); }}
            type="button"
-           aria-label="Toggle Map Orientation"
-           className="absolute bottom-4 left-1/2 -translate-x-1/2 text-[9px] font-black tracking-[0.1em] text-green-500/90 bg-black/80 px-2.5 py-1 rounded-sm backdrop-blur-md z-40 border border-green-500/20 pointer-events-auto hover:bg-green-500/20 transition-all active:scale-95 touch-manipulation"
+           className="absolute bottom-4 left-1/2 -translate-x-1/2 text-[9px] font-bold tracking-widest text-green-400 bg-black/80 px-3 py-1.5 rounded-sm backdrop-blur-md z-40 border border-green-500/30 shadow-lg pointer-events-auto active:scale-95 active:bg-green-900/50 transition-all touch-manipulation"
         >
-          {mode === 'heading-up' ? 'H-UP' : 'N-UP'}
+          {mode === 'heading-up' ? 'HDG UP' : 'NTH UP'}
         </button>
       </div>
 
       {isOffCenter && (
         <button 
-          onClick={onRecenter}
+          onClick={() => { triggerHaptic(); onRecenter(); }}
           type="button"
-          aria-label="Recenter Map"
-          className="absolute -bottom-8 left-1/2 -translate-x-1/2 p-2 rounded-full bg-background/80 backdrop-blur-sm border border-border/40 text-muted-foreground hover:text-foreground hover:border-foreground/40 transition-all duration-200 active:scale-95 shadow-lg z-30 touch-manipulation"
+          className="absolute -bottom-10 left-1/2 -translate-x-1/2 p-3 rounded-full bg-background border border-border/40 text-foreground hover:bg-muted transition-all duration-200 active:scale-95 shadow-xl z-30 touch-manipulation"
         >
-          <Crosshair className="w-4 h-4" />
+          <Crosshair className="w-5 h-5" />
         </button>
       )}
     </div>
@@ -489,21 +452,22 @@ RadarMapbox.displayName = "RadarMapbox";
 
 const CompassTicks = memo(() => (
   <>
-    <circle cx="50" cy="50" r="48" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/10 fill-none" />
-    {[...Array(60)].map((_, i) => {
-      const isCardinal = i % 15 === 0;
-      const isMajor = i % 5 === 0;  
-      const length = isCardinal ? 10 : isMajor ? 7 : 4;
+    <circle cx="50" cy="50" r="46" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/20 fill-none" />
+    {[...Array(72)].map((_, i) => {
+      const isCardinal = i % 18 === 0;
+      const isMajor = i % 6 === 0;
+      const length = isCardinal ? 6 : isMajor ? 4 : 2;
       const width = isCardinal ? 1.5 : isMajor ? 1 : 0.5;
-      const colorClass = isCardinal ? "text-foreground" : isMajor ? "text-foreground/60" : "text-muted-foreground/30";
+      const colorClass = isCardinal ? "text-foreground" : isMajor ? "text-foreground/70" : "text-muted-foreground/30";
       return (
-        <line key={i} x1="50" y1="6" x2="50" y2={6 + length} transform={`rotate(${i * 6} 50 50)`} stroke="currentColor" strokeWidth={width} className={colorClass} strokeLinecap="round" />
+        <line key={i} x1="50" y1="5" x2="50" y2={5 + length} transform={`rotate(${i * 5} 50 50)`} stroke="currentColor" strokeWidth={width} className={colorClass} strokeLinecap="square" />
       );
     })}
-    <text x="50" y="28" textAnchor="middle" className="text-[7px] font-black fill-red-500" transform="rotate(0 50 50)">N</text>
-    <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(90 50 50)">E</text>
-    <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(180 50 50)">S</text>
-    <text x="50" y="28" textAnchor="middle" className="text-[6px] font-bold fill-foreground" transform="rotate(270 50 50)">W</text>
+    <text x="50" y="22" textAnchor="middle" className="text-[6px] font-black fill-red-500" transform="rotate(0 50 50)">N</text>
+    <text x="50" y="22" textAnchor="middle" className="text-[5px] font-bold fill-foreground" transform="rotate(90 50 50)">E</text>
+    <text x="50" y="22" textAnchor="middle" className="text-[5px] font-bold fill-foreground" transform="rotate(180 50 50)">S</text>
+    <text x="50" y="22" textAnchor="middle" className="text-[5px] font-bold fill-foreground" transform="rotate(270 50 50)">W</text>
+    <path d="M 48 50 L 52 50 M 50 48 L 50 52" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/50" />
   </>
 ));
 CompassTicks.displayName = "CompassTicks";
@@ -526,55 +490,72 @@ const CompassDisplay = memo(({
   const displayHeading = trueHeading !== null ? Math.round(trueHeading) : 0;
 
   return (
-    <div className="flex flex-col items-center justify-center mb-6 relative z-10 animate-in zoom-in-50 duration-700 fade-in">
+    <div className="flex flex-col items-center justify-center relative z-10 shrink-0">
       <div 
-        className="relative w-64 h-64 md:w-72 md:h-72 cursor-pointer group" 
+        className="relative w-56 h-56 md:w-64 md:h-64 cursor-pointer group select-none touch-manipulation" 
         onClick={onClick}
         role="button"
-        aria-label="Compass"
+        aria-label="Calibrate Compass"
       >
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
-          <div className="w-0 h-0 border-l-[7px] border-l-transparent border-r-[7px] border-r-transparent border-t-[12px] border-t-red-500/90 drop-shadow-lg" />
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 z-20 pointer-events-none flex flex-col items-center">
+          <div className="w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[8px] border-t-red-500 drop-shadow-md translate-y-1" />
         </div>
         
         <div 
-          className="w-full h-full will-change-transform transition-transform duration-100 ease-linear"
+          className="w-full h-full will-change-transform transition-transform duration-75 ease-out rounded-full border border-border/10 bg-gradient-to-br from-background/80 to-background/40 backdrop-blur-sm shadow-xl"
           style={{ transform: `rotate(${-rotation}deg)` }}
         >
-          <svg viewBox="0 0 100 100" className="w-full h-full select-none pointer-events-none">
+          <svg viewBox="0 0 100 100" className="w-full h-full select-none pointer-events-none p-1">
             <CompassTicks />
           </svg>
         </div>
+
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center z-20 pointer-events-none mix-blend-difference">
+             <span className="text-4xl font-mono font-black tracking-tighter text-foreground tabular-nums">
+                {permissionGranted ? `${displayHeading}°` : "--"}
+             </span>
+             <span className="text-[10px] font-bold text-muted-foreground tracking-[0.3em] uppercase">
+                {permissionGranted ? directionStr : "---"}
+             </span>
+        </div>
         
         {!permissionGranted && !hasError && (
-          <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-background/5 backdrop-blur-[2px]">
-            <button type="button" className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.2em] text-foreground/80 animate-pulse bg-background/90 backdrop-blur-md px-6 py-3 rounded-full border border-border/40 shadow-xl hover:scale-105 transition-transform active:scale-95 touch-manipulation">
-              <CompassIcon className="w-4 h-4" /> Tap to Align
+          <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-background/60 backdrop-blur-sm">
+            <button type="button" className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-primary animate-pulse bg-background px-4 py-2 rounded-full border border-primary/20 shadow-xl">
+              <CompassIcon className="w-3 h-3" /> Align
             </button>
           </div>
         )}
         
         {hasError && (
           <div className="absolute inset-0 flex items-center justify-center z-30 bg-background/50 backdrop-blur-sm rounded-full">
-            <WifiOff className="w-10 h-10 text-destructive/80" />
+            <WifiOff className="w-8 h-8 text-destructive/80" />
           </div>
         )}
-      </div>
-      
-      <div className="mt-4 flex flex-col items-center">
-        <div className="text-5xl md:text-6xl font-mono font-black tracking-tighter tabular-nums text-foreground select-all">
-          {permissionGranted ? `${displayHeading}°` : "--°"}
-        </div>
-        <div className="text-sm font-bold text-muted-foreground/60 tracking-[0.5em] uppercase mt-2">
-          {permissionGranted ? directionStr : "---"}
-        </div>
       </div>
     </div>
   );
 });
 CompassDisplay.displayName = "CompassDisplay";
 
-const CoordinateDisplay = memo(({ 
+const StatCard = memo(({ icon: Icon, label, value, subValue, unit }: { icon: any, label: string, value: string, subValue?: string, unit?: string }) => (
+  <div className="flex flex-col items-start justify-between p-4 rounded-2xl bg-muted/5 border border-white/5 backdrop-blur-sm hover:bg-muted/10 transition-colors w-full min-w-[100px] h-full shadow-sm">
+    <div className="flex w-full items-center justify-between mb-2 opacity-60">
+      <span className="text-[10px] uppercase tracking-widest font-bold">{label}</span>
+      <Icon className="w-3.5 h-3.5" />
+    </div>
+    <div className="flex flex-col items-baseline">
+      <div className="flex items-baseline gap-1">
+         <span className="text-xl md:text-2xl font-mono font-bold text-foreground tracking-tight tabular-nums">{value}</span>
+         {unit && <span className="text-xs font-medium text-muted-foreground">{unit}</span>}
+      </div>
+      {subValue && <span className="text-[10px] text-muted-foreground font-medium">{subValue}</span>}
+    </div>
+  </div>
+));
+StatCard.displayName = "StatCard";
+
+const CoordinateRow = memo(({ 
   label, 
   value, 
   type 
@@ -587,284 +568,366 @@ const CoordinateDisplay = memo(({
   const [copied, setCopied] = useState(false);
   
   const handleCopy = async () => {
+    triggerHaptic();
     if (!navigator.clipboard) return;
     try { 
       await navigator.clipboard.writeText(formattedValue); 
       setCopied(true); 
       setTimeout(() => setCopied(false), 2000); 
-    } catch (e) {
-      console.error('Copy failed:', e);
-    }
+    } catch (e) { console.error(e); }
   };
   
   return (
-    <div 
-      className="group cursor-pointer flex flex-col items-center justify-center transition-all duration-200 hover:opacity-70 active:scale-95 px-4 py-2 rounded-lg hover:bg-muted/20 touch-manipulation" 
+    <button 
+      className="group w-full flex items-center justify-between px-4 py-3 rounded-xl bg-muted/10 border border-white/5 hover:bg-muted/20 active:scale-[0.98] transition-all touch-manipulation" 
       onClick={handleCopy}
-      role="button"
-      aria-label={`Copy ${label}`}
+      type="button"
     >
-      <span className={`text-[9px] uppercase tracking-[0.25em] mb-2 font-bold select-none transition-colors duration-300 ${copied ? "text-green-500" : "text-muted-foreground"}`}>
-        {copied ? "COPIED" : label}
-      </span>
-      <span className={`text-2xl md:text-4xl lg:text-5xl font-black tracking-tighter font-mono tabular-nums transition-colors duration-300 select-all whitespace-nowrap ${copied ? "text-green-500" : "text-foreground"}`}>
-        {formattedValue}
-      </span>
-    </div>
+      <div className="flex flex-col items-start">
+         <span className={`text-[9px] uppercase tracking-widest font-bold transition-colors ${copied ? "text-green-500" : "text-muted-foreground"}`}>
+           {copied ? "COPIED" : label}
+         </span>
+         <span className="text-xl md:text-2xl font-mono font-medium tracking-tight text-foreground tabular-nums mt-0.5">
+           {formattedValue}
+         </span>
+      </div>
+      <div className={`p-2 rounded-full transition-colors ${copied ? "bg-green-500/20 text-green-500" : "bg-transparent text-muted-foreground/30 group-hover:text-foreground"}`}>
+          {copied ? <div className="w-1.5 h-1.5 rounded-full bg-green-500" /> : <Maximize2 className="w-3 h-3" />}
+      </div>
+    </button>
   );
 });
-CoordinateDisplay.displayName = "CoordinateDisplay";
+CoordinateRow.displayName = "CoordinateRow";
 
-const StatMinimal = memo(({ icon: Icon, label, value }: { icon: any, label: string, value: string }) => (
-  <div className="flex flex-col items-center justify-center min-w-[80px] p-3 rounded-lg hover:bg-muted/30 transition-colors">
-    <div className="flex items-center gap-1.5 text-muted-foreground mb-1.5">
-      <Icon className="w-3.5 h-3.5 opacity-60" />
-      <span className="text-[9px] uppercase tracking-widest font-bold opacity-80">{label}</span>
-    </div>
-    <span className="text-lg md:text-xl font-mono font-bold text-foreground/90 tabular-nums whitespace-nowrap">{value}</span>
-  </div>
-));
-StatMinimal.displayName = "StatMinimal";
+// --- FULL MAP DRAWER COMPONENT ---
+const FullMapDrawer = memo(({ 
+  isOpen, 
+  onClose, 
+  lat, 
+  lng 
+}: { 
+  isOpen: boolean, 
+  onClose: () => void, 
+  lat: number, 
+  lng: number 
+}) => {
+  
+  const bbox = useMemo(() => {
+    const d = 0.005; 
+    return `${lng - d},${lat - d},${lng + d},${lat + d}`;
+  }, [lat, lng]);
+
+  const embedUrl = `https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat},${lng}`;
+
+  const openAppleMaps = () => {
+    window.open(`http://maps.apple.com/?q=${lat},${lng}`, '_blank');
+  };
+
+  const openGoogleMaps = () => {
+    window.open(`https://www.google.com/maps/search/?api=1&query=${lat},${lng}`, '_blank');
+  };
+
+  return (
+    <>
+      <div 
+        className={`fixed inset-0 bg-black/60 backdrop-blur-sm z-50 transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} 
+        onClick={onClose}
+      />
+      
+      <div className={`fixed bottom-0 left-0 right-0 h-[85vh] bg-background/95 backdrop-blur-xl border-t border-border/20 rounded-t-3xl shadow-2xl z-[51] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
+        
+        {/* Handle */}
+        <div className="absolute top-0 left-0 right-0 h-8 flex items-center justify-center z-[52] pointer-events-none" onClick={onClose}>
+          <div className="w-12 h-1.5 bg-muted-foreground/20 rounded-full" />
+        </div>
+
+        {/* Map Header */}
+        <div className="absolute top-4 left-6 z-[53] pointer-events-none">
+            <h3 className="text-lg font-bold text-foreground/80">Location Map</h3>
+            <p className="text-xs text-muted-foreground font-mono">{lat.toFixed(4)}, {lng.toFixed(4)}</p>
+        </div>
+
+        {/* Controls Overlay */}
+        <div className="absolute top-4 right-4 z-[53] flex flex-col gap-2">
+           <button onClick={onClose} className="p-3 rounded-full bg-muted/80 backdrop-blur-md border border-border/20 text-foreground active:scale-95 transition-transform" aria-label="Close Map">
+              <X className="w-5 h-5" />
+           </button>
+        </div>
+
+        {/* Action Bar */}
+        <div className="absolute bottom-8 left-4 right-4 z-[53] flex gap-3 pb-safe">
+            <button onClick={openAppleMaps} className="flex-1 py-3 rounded-xl bg-white text-black font-bold text-sm shadow-lg active:scale-95 transition-transform flex items-center justify-center gap-2">
+                <MapPin className="w-4 h-4" /> Apple Maps
+            </button>
+            <button onClick={openGoogleMaps} className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-bold text-sm shadow-lg active:scale-95 transition-transform flex items-center justify-center gap-2">
+                <LocateFixed className="w-4 h-4" /> Google Maps
+            </button>
+        </div>
+
+        <div className="w-full h-full rounded-t-3xl overflow-hidden relative bg-muted mt-0 pt-0">
+          {isOpen && (
+             <iframe
+               title="OpenStreetMap"
+               width="100%"
+               height="100%"
+               frameBorder="0"
+               scrolling="no"
+               marginHeight={0}
+               marginWidth={0}
+               src={embedUrl}
+               className="w-full h-full filter contrast-[1.1] brightness-[0.95] grayscale-[0.2]"
+               allow="geolocation"
+             />
+          )}
+          <div className="absolute inset-0 flex items-center justify-center -z-10">
+             <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+          </div>
+        </div>
+      </div>
+    </>
+  );
+});
+FullMapDrawer.displayName = "FullMapDrawer";
 
 export default function GeoLocation() {
   const { coords, error, loading } = useGeolocation();
   const { heading, trueHeading, requestAccess, permissionGranted, error: compassError } = useCompass();
   const [address, setAddress] = useState<string | null>(null);
   const [weather, setWeather] = useState<WeatherData | null>(null);
-  const [isCtxLoading, setIsCtxLoading] = useState(false);
   const [path, setPath] = useState<GeoPoint[]>([]);
   const [units, setUnits] = useState<UnitSystem>('metric');
   const [mapMode, setMapMode] = useState<MapMode>('heading-up');
   const [lastApiFetch, setLastApiFetch] = useState<{lat: number, lng: number} | null>(null);
   const [mounted, setMounted] = useState(false);
+  const [isMapDrawerOpen, setIsMapDrawerOpen] = useState(false);
+  
+  const isMountedRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    setMounted(true);
+  useEffect(() => { 
+    isMountedRef.current = true;
+    setMounted(true); 
+    return () => { isMountedRef.current = false; };
   }, []);
 
   useEffect(() => {
     if (!coords) return;
-    
     setPath(prev => {
-      const newPoint = { 
-        lat: coords.latitude, 
-        lng: coords.longitude, 
-        id: Date.now(),
-        timestamp: Date.now()
-      };
-      
+      const newPoint = { lat: coords.latitude, lng: coords.longitude, id: Date.now(), timestamp: Date.now() };
       if (prev.length === 0) return [newPoint];
-      
       const last = prev[prev.length - 1];
       const distance = getDistance(last.lat, last.lng, coords.latitude, coords.longitude);
-      
       if (distance > TRAIL_MIN_DISTANCE) {
         const newPath = [...prev, newPoint];
-        return newPath.length > TRAIL_MAX_POINTS 
-          ? newPath.slice(newPath.length - TRAIL_MAX_POINTS) 
-          : newPath;
+        return newPath.length > TRAIL_MAX_POINTS ? newPath.slice(newPath.length - TRAIL_MAX_POINTS) : newPath;
       }
       return prev;
     });
   }, [coords]);
 
   const resetRadar = useCallback(() => { 
-    if (coords) {
-      setPath([{ 
-        lat: coords.latitude, 
-        lng: coords.longitude, 
-        id: Date.now(),
-        timestamp: Date.now()
-      }]); 
-    }
+    if (coords) setPath([{ lat: coords.latitude, lng: coords.longitude, id: Date.now(), timestamp: Date.now() }]); 
   }, [coords]);
 
   const recenterMap = useCallback(() => resetRadar(), [resetRadar]);
-  const toggleUnits = useCallback(() => setUnits(prev => prev === 'metric' ? 'imperial' : 'metric'), []);
+  const toggleUnits = useCallback(() => { triggerHaptic(); setUnits(prev => prev === 'metric' ? 'imperial' : 'metric'); }, []);
   const toggleMapMode = useCallback(() => setMapMode(prev => prev === 'heading-up' ? 'north-up' : 'heading-up'), []);
 
   const debouncedCoords = useDebounce(coords, 2000);
 
   useEffect(() => {
     if (!debouncedCoords) return;
-    
-    // Check if moved enough to fetch new data
     if (lastApiFetch) {
         const distKm = getDistance(lastApiFetch.lat, lastApiFetch.lng, debouncedCoords.latitude, debouncedCoords.longitude) / 1000;
         if (distKm < API_FETCH_DISTANCE_THRESHOLD && address && weather) return;
     }
-
-    if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-    }
+    
+    if (abortControllerRef.current) abortControllerRef.current.abort();
     abortControllerRef.current = new AbortController();
     
     const fetchData = async () => {
-      setIsCtxLoading(true);
       try {
         const { latitude, longitude } = debouncedCoords;
         const signal = abortControllerRef.current?.signal;
         
         const [geoRes, weatherRes] = await Promise.allSettled([
-          fetch(
-            `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=14`, 
-            { signal }
-          ),
-          fetch(
-            `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code&timezone=auto`, 
-            { signal }
-          )
+          fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=14`, { signal }),
+          fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code&timezone=auto`, { signal })
         ]);
         
-        if (signal?.aborted) return;
+        if (signal?.aborted || !isMountedRef.current) return;
 
         if (geoRes.status === 'fulfilled' && geoRes.value.ok) {
           try {
             const data = await geoRes.value.json();
             const addr = data.address;
             if (addr) {
-              const location = [
-                addr.city, addr.town, addr.village, addr.hamlet, addr.suburb, addr.county
-              ].find(v => v && v.length > 0) || "Unknown Location";
+              const location = [addr.city, addr.town, addr.village, addr.suburb].find(v => v) || "Wilderness";
               setAddress(addr.country_code ? `${location}, ${addr.country_code.toUpperCase()}` : location);
             }
-          } catch (e) { console.warn("Geo parse error", e); }
+          } catch (e) {}
         }
-        
+
         if (weatherRes.status === 'fulfilled' && weatherRes.value.ok) {
           try {
             const data = await weatherRes.value.json();
             const info = getWeatherInfo(data.current.weather_code);
-            setWeather({ 
-              temp: data.current.temperature_2m, 
-              code: data.current.weather_code, 
-              description: info.label 
-            });
-          } catch (e) { console.warn("Weather parse error", e); }
+            setWeather({ temp: data.current.temperature_2m, code: data.current.weather_code, description: info.label });
+          } catch (e) {}
         }
         
         setLastApiFetch({ lat: latitude, lng: longitude });
-
       } catch (err) {
-        if (err instanceof Error && err.name !== 'AbortError') {
-          console.error('Fetch error:', err);
-        }
-      } finally { 
-        if (abortControllerRef.current?.signal.aborted === false) {
-             setIsCtxLoading(false); 
-        }
+        if (err instanceof Error && err.name !== 'AbortError') console.error(err);
       }
     };
-    
     fetchData();
     return () => { if (abortControllerRef.current) abortControllerRef.current.abort(); };
   }, [debouncedCoords, lastApiFetch, address, weather]);
 
   const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
-
   if (!mounted) return null;
 
   return (
-    <main className="flex flex-col items-center justify-center min-h-screen bg-background text-foreground p-4 overflow-hidden select-none touch-manipulation">
-      <div className="absolute top-4 right-4 z-50 flex gap-2">
-        <button 
-          onClick={toggleUnits} 
-          type="button"
-          aria-label="Toggle Units"
-          className="p-2 rounded-full bg-muted/20 hover:bg-muted/40 backdrop-blur-md text-xs font-bold uppercase tracking-wider text-muted-foreground transition-colors border border-border/10 touch-manipulation"
-        >
-          {units === 'metric' ? 'MET' : 'IMP'}
-        </button>
+    <main className="relative flex flex-col items-center min-h-screen w-full bg-[#09090b] text-foreground p-4 md:p-8 overflow-x-hidden touch-manipulation font-sans selection:bg-green-500/30">
+      
+      {/* Background Texture */}
+      <div className="absolute inset-0 pointer-events-none z-0">
+          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(34,197,94,0.05),transparent_70%)]" />
+          <div className="absolute inset-0 opacity-[0.03]" 
+               style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '50px 50px' }} />
       </div>
 
-      <div className="w-full max-w-7xl flex flex-col items-center justify-start space-y-8 pb-12 mt-10 md:mt-0">
-        <CompassDisplay 
-          heading={heading} 
-          trueHeading={trueHeading} 
-          onClick={requestAccess} 
-          hasError={!!compassError} 
-          permissionGranted={permissionGranted} 
-        />
+      {/* Header / Top Bar */}
+      <div className="w-full max-w-5xl flex justify-between items-start z-40 mb-6">
+         <div className="flex flex-col">
+             <h1 className="text-xs font-black tracking-[0.3em] text-muted-foreground/60 uppercase">Field Navigation</h1>
+             <div className="flex items-center gap-2 mt-1">
+                 <div className={`w-2 h-2 rounded-full ${coords ? "bg-green-500 animate-pulse" : "bg-red-500"}`} />
+                 <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">{coords ? "Live Data" : "Offline"}</span>
+             </div>
+         </div>
+         <button 
+           onClick={toggleUnits} 
+           type="button"
+           className="px-3 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground transition-all active:scale-95"
+         >
+           {units === 'metric' ? 'MET' : 'IMP'}
+         </button>
+      </div>
+
+      <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 pb-20 z-10 min-h-[500px]">
         
         {loading && !coords && (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 flex flex-col items-center space-y-4 pt-8">
-            <Loader2 className="w-6 h-6 animate-spin text-muted-foreground/60" />
-            <span className="text-[10px] tracking-[0.25em] uppercase text-muted-foreground font-medium">Acquiring Satellites</span>
+          <div className="flex flex-col items-center justify-center h-64 space-y-6 animate-pulse">
+            <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
+            <span className="text-xs tracking-[0.3em] uppercase text-green-500/70 font-bold">Initializing GPS...</span>
           </div>
         )}
-        
+
         {error && !coords && (
-          <Alert variant="destructive" className="max-w-md bg-transparent border border-destructive/30 backdrop-blur-sm">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle className="text-sm font-bold uppercase tracking-wide">Location Error</AlertTitle>
-            <AlertDescription className="text-xs opacity-90">{error}</AlertDescription>
-          </Alert>
+           <Alert variant="destructive" className="max-w-md bg-red-950/20 border-red-900/50 text-red-200">
+             <AlertCircle className="h-4 w-4" />
+             <AlertTitle>GPS Signal Lost</AlertTitle>
+             <AlertDescription>{error}. Check device permissions.</AlertDescription>
+           </Alert>
         )}
-        
+
         {coords && (
-          <div className="w-full flex flex-col items-center gap-8 animate-in slide-in-from-bottom-4 fade-in duration-700">
-            <div className="relative flex flex-col items-center gap-4">
-              <RadarMapbox 
-                path={path} 
-                lat={coords.latitude} 
-                lng={coords.longitude} 
-                heading={heading || 0}
-                mode={mapMode}
-                onRecenter={recenterMap}
-                onToggleMode={toggleMapMode}
-              />
-              
-              {path.length > 1 && (
-                <button 
-                  onClick={resetRadar} 
-                  type="button"
-                  className="flex items-center gap-2 text-xs text-muted-foreground hover:text-destructive transition-colors px-3 py-1.5 rounded-full hover:bg-destructive/10 active:scale-95 touch-manipulation"
-                >
-                  <Trash2 className="w-3 h-3" />
-                  <span className="uppercase tracking-wider font-medium">Clear Trail</span>
-                </button>
-              )}
-            </div>
-            
-            <div className="flex flex-col lg:flex-row gap-6 lg:gap-20 items-center justify-center text-center">
-              <CoordinateDisplay label="Latitude" value={coords.latitude} type="lat" />
-              <div className="hidden lg:block h-16 w-px bg-border/30" />
-              <CoordinateDisplay label="Longitude" value={coords.longitude} type="lng" />
-            </div>
-            
-            <div className="flex flex-wrap justify-center gap-4 md:gap-12 border-t border-border/20 pt-6 w-full max-w-3xl">
-              <StatMinimal icon={Mountain} label="Alt" value={convertAltitude(coords.altitude, units)} />
-              <StatMinimal icon={Activity} label="Spd" value={convertSpeed(coords.speed, units)} />
-              <StatMinimal icon={Navigation} label="Acc" value={coords.accuracy ? `±${Math.round(coords.accuracy)} m` : '-- m'} />
-            </div>
-            
-            <div className="w-full flex flex-col items-center gap-3 mt-2">
-              <button 
-                type="button"
-                onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${coords.latitude},${coords.longitude}`, '_blank', 'noopener,noreferrer')} 
-                className="group flex items-center gap-3 text-muted-foreground hover:text-foreground transition-all duration-300 px-5 py-2.5 rounded-full hover:bg-muted/30 active:scale-95 touch-manipulation"
-              >
-                <MapPin className="w-4 h-4 text-red-500/80 group-hover:scale-110 transition-transform" />
-                {(!address && isCtxLoading) ? (
-                  <div className="h-4 w-40 bg-muted-foreground/10 animate-pulse rounded" />
-                ) : (
-                  <span className="text-base md:text-lg font-light tracking-wide text-center">{address || "Locating..."}</span>
-                )}
-              </button>
-              
-              {weather && (
-                <div className="flex items-center gap-3 text-muted-foreground/80 px-5 py-2 rounded-full bg-muted/10 backdrop-blur-sm border border-border/20">
-                  <WeatherIcon className="w-4 h-4" />
-                  <span className="text-sm font-medium text-foreground tabular-nums">{convertTemp(weather.temp, units)}</span>
-                  <span className="w-px h-3 bg-border/60" />
-                  <span className="text-[10px] uppercase tracking-wider font-bold">{weather.description}</span>
-                </div>
-              )}
-            </div>
+          <div className="w-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-12 gap-6 animate-in fade-in slide-in-from-bottom-8 duration-700">
+             
+             {/* Left Column: Coordinates & Stats */}
+             <div className="lg:col-span-4 flex flex-col gap-4 order-2 md:order-1">
+                 
+                 {/* Coordinates Module */}
+                 <div className="bg-card/30 backdrop-blur-sm border border-white/5 rounded-3xl p-5 space-y-3">
+                    <div className="flex items-center justify-between mb-2">
+                        <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-widest">Position</span>
+                        <MapPin className="w-3 h-3 text-green-500" />
+                    </div>
+                    <CoordinateRow label="Latitude" value={coords.latitude} type="lat" />
+                    <CoordinateRow label="Longitude" value={coords.longitude} type="lng" />
+                    
+                    <button 
+                      type="button"
+                      onClick={() => { triggerHaptic(); setIsMapDrawerOpen(true); }}
+                      className="w-full mt-2 py-3 rounded-xl bg-green-500/10 hover:bg-green-500/20 text-green-500 text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 transition-colors active:scale-[0.98]"
+                    >
+                      <MapPin className="w-3 h-3" /> View Map
+                    </button>
+                 </div>
+
+                 {/* Stats Grid */}
+                 <div className="grid grid-cols-3 gap-3">
+                    <StatCard icon={Mountain} label="Alt" value={convertAltitude(coords.altitude, units)} unit={units === 'metric' ? 'm' : 'ft'} />
+                    <StatCard icon={Activity} label="Spd" value={convertSpeed(coords.speed, units)} unit={units === 'metric' ? 'km/h' : 'mph'} />
+                    <StatCard icon={Navigation} label="Acc" value={coords.accuracy ? `±${Math.round(coords.accuracy)}` : '--'} unit="m" />
+                 </div>
+
+                 {/* Weather Pill */}
+                 {weather && (
+                   <div className="flex items-center justify-between p-4 rounded-2xl bg-gradient-to-r from-blue-500/10 to-transparent border border-blue-500/10">
+                      <div className="flex items-center gap-3">
+                          <div className="p-2 rounded-full bg-blue-500/20 text-blue-400">
+                            <WeatherIcon className="w-4 h-4" />
+                          </div>
+                          <div className="flex flex-col">
+                             <span className="text-lg font-bold tabular-nums leading-none">{convertTemp(weather.temp, units)}</span>
+                             <span className="text-[9px] uppercase font-bold text-muted-foreground tracking-wide mt-1">{weather.description}</span>
+                          </div>
+                      </div>
+                      <div className="text-right">
+                         <span className="text-[9px] uppercase font-bold text-muted-foreground block">{address ? address.split(',')[0] : "Local"}</span>
+                      </div>
+                   </div>
+                 )}
+             </div>
+
+             {/* Center Column: Visuals */}
+             <div className="lg:col-span-8 flex flex-col md:flex-row items-center justify-center gap-8 order-1 md:order-2 p-4 md:p-0">
+                 <CompassDisplay 
+                    heading={heading} 
+                    trueHeading={trueHeading} 
+                    onClick={requestAccess} 
+                    hasError={!!compassError} 
+                    permissionGranted={permissionGranted} 
+                 />
+                 
+                 <div className="h-px w-full md:w-px md:h-48 bg-white/10" />
+
+                 <div className="flex flex-col items-center gap-4">
+                    <RadarMapbox 
+                      path={path} 
+                      lat={coords.latitude} 
+                      lng={coords.longitude} 
+                      heading={heading || 0}
+                      mode={mapMode}
+                      onRecenter={recenterMap}
+                      onToggleMode={toggleMapMode}
+                    />
+                    {path.length > 1 && (
+                      <button 
+                        onClick={() => { triggerHaptic(); resetRadar(); }} 
+                        className="text-[9px] text-muted-foreground hover:text-red-400 uppercase tracking-widest font-bold flex items-center gap-2 transition-colors py-2 px-4 rounded-full hover:bg-white/5"
+                      >
+                        <Trash2 className="w-3 h-3" /> Clear Trail
+                      </button>
+                    )}
+                 </div>
+             </div>
+
           </div>
         )}
       </div>
+
+      {coords && (
+        <FullMapDrawer 
+          isOpen={isMapDrawerOpen} 
+          onClose={() => setIsMapDrawerOpen(false)} 
+          lat={coords.latitude} 
+          lng={coords.longitude} 
+        />
+      )}
     </main>
   );
 }
