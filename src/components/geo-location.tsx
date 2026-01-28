@@ -54,7 +54,7 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 const triggerHaptic = () => {
   try {
     if (typeof navigator !== 'undefined' && navigator.vibrate) {
-      navigator.vibrate(15);
+      navigator.vibrate(10);
     }
   } catch (e) {}
 };
@@ -349,7 +349,8 @@ const RadarMapbox = memo(({
   const markerRotation = mode === 'heading-up' ? 0 : heading;
 
   return (
-    <div className="relative w-72 h-72 lg:w-96 lg:h-96 shrink-0">
+    // Scaled down to w-60 (15rem) on mobile to fix overflow
+    <div className="relative w-60 h-60 md:w-80 md:h-80 shrink-0 transition-all duration-300">
       <div className="absolute inset-0 rounded-full border border-border/20 bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
       <div className="w-full h-full rounded-full border-4 border-muted/20 bg-black overflow-hidden relative isolate">
         
@@ -399,7 +400,7 @@ const RadarMapbox = memo(({
           </div>
         </div>
 
-        {/* HUD Elements (Static relative to device) */}
+        {/* HUD Elements */}
         <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20" />
         <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
         
@@ -408,7 +409,7 @@ const RadarMapbox = memo(({
              <div className="absolute inset-0 bg-[conic-gradient(from_0deg,transparent_0deg,transparent_280deg,rgba(34,197,94,0.15)_360deg)] animate-[spin_4s_linear_infinite]" />
         </div>
 
-        {/* Reticle / Bezel */}
+        {/* Reticle */}
         <div className="absolute inset-0 pointer-events-none z-30">
            {/* Center Crosshair */}
            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 opacity-50">
@@ -420,7 +421,7 @@ const RadarMapbox = memo(({
 
           {/* North Indicator */}
           <div className="absolute top-3 left-1/2 -translate-x-1/2 text-[10px] font-black text-red-500 bg-black/50 px-2 rounded-full backdrop-blur-sm border border-red-500/30"
-               style={{ transform: `rotate(${-rotation}deg)`, transformOrigin: 'center 138px' }}>N</div>
+               style={{ transform: `rotate(${-rotation}deg)`, transformOrigin: 'center 110px' }}>N</div>
         </div>
         
         {imgLoaded && !mapError && (
@@ -492,7 +493,8 @@ const CompassDisplay = memo(({
   return (
     <div className="flex flex-col items-center justify-center relative z-10 shrink-0">
       <div 
-        className="relative w-56 h-56 md:w-64 md:h-64 cursor-pointer group select-none touch-manipulation" 
+        // Scaled down to w-56 for mobile
+        className="relative w-56 h-56 md:w-64 md:h-64 cursor-pointer group select-none touch-manipulation transition-all duration-300" 
         onClick={onClick}
         role="button"
         aria-label="Calibrate Compass"
@@ -789,7 +791,8 @@ export default function GeoLocation() {
   if (!mounted) return null;
 
   return (
-    <main className="relative flex flex-col items-center min-h-screen w-full bg-[#09090b] text-foreground p-4 md:p-8 overflow-x-hidden touch-manipulation font-sans selection:bg-green-500/30">
+    // Changed min-h-screen to min-h-[100dvh] for mobile browser address bars
+    <main className="relative flex flex-col items-center min-h-[100dvh] w-full bg-[#09090b] text-foreground p-4 md:p-8 overflow-x-hidden touch-manipulation font-sans selection:bg-green-500/30 pb-32">
       
       {/* Background Texture */}
       <div className="absolute inset-0 pointer-events-none z-0">
@@ -799,7 +802,7 @@ export default function GeoLocation() {
       </div>
 
       {/* Header / Top Bar */}
-      <div className="w-full max-w-5xl flex justify-between items-start z-40 mb-6">
+      <div className="w-full max-w-5xl flex justify-between items-start z-40 mb-6 shrink-0">
          <div className="flex flex-col">
              <h1 className="text-xs font-black tracking-[0.3em] text-muted-foreground/60 uppercase">Field Navigation</h1>
              <div className="flex items-center gap-2 mt-1">
@@ -816,7 +819,7 @@ export default function GeoLocation() {
          </button>
       </div>
 
-      <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 pb-20 z-10 min-h-[500px]">
+      <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 z-10">
         
         {loading && !coords && (
           <div className="flex flex-col items-center justify-center h-64 space-y-6 animate-pulse">
@@ -834,7 +837,7 @@ export default function GeoLocation() {
         )}
 
         {coords && (
-          <div className="w-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-12 gap-6 animate-in fade-in slide-in-from-bottom-8 duration-700">
+          <div className="w-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-12 gap-8 animate-in fade-in slide-in-from-bottom-8 duration-700">
              
              {/* Left Column: Coordinates & Stats */}
              <div className="lg:col-span-4 flex flex-col gap-4 order-2 md:order-1">
@@ -884,7 +887,7 @@ export default function GeoLocation() {
              </div>
 
              {/* Center Column: Visuals */}
-             <div className="lg:col-span-8 flex flex-col md:flex-row items-center justify-center gap-8 order-1 md:order-2 p-4 md:p-0">
+             <div className="lg:col-span-8 flex flex-col md:flex-row items-center justify-center gap-12 order-1 md:order-2 p-0">
                  <CompassDisplay 
                     heading={heading} 
                     trueHeading={trueHeading} 
@@ -893,9 +896,9 @@ export default function GeoLocation() {
                     permissionGranted={permissionGranted} 
                  />
                  
-                 <div className="h-px w-full md:w-px md:h-48 bg-white/10" />
+                 <div className="h-px w-32 md:w-px md:h-32 bg-white/10" />
 
-                 <div className="flex flex-col items-center gap-4">
+                 <div className="flex flex-col items-center gap-6">
                     <RadarMapbox 
                       path={path} 
                       lat={coords.latitude} 
