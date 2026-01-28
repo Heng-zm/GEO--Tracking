@@ -1,3 +1,4 @@
+
 "use client";
 
 import React, { useState, useEffect, useRef, useMemo, memo, useCallback } from 'react';
@@ -5,14 +6,14 @@ import {
   Sun, Cloud, CloudRain, CloudLightning, Snowflake, CloudFog, CloudSun,
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
-  Maximize2, X, ExternalLink, LocateFixed
+  Maximize2, X, ExternalLink, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 // --- Configuration ---
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 const RADAR_ZOOM = 18;
-const TRAIL_MAX_POINTS = 100;
+const TRAIL_MAX_POINTS = 100; // Visual trail only
 const TRAIL_MIN_DISTANCE = 5; 
 const MAP_UPDATE_THRESHOLD = 40; 
 const API_FETCH_DISTANCE_THRESHOLD = 0.5; 
@@ -37,9 +38,13 @@ type WeatherData = {
   temp: number;
   code: number;
   description: string;
+  windSpeed: number;
+  windDir: number;
+  sunrise: string[]; // Array of ISO strings (Today, Tomorrow)
+  sunset: string[];  // Array of ISO strings (Today, Tomorrow)
 };
 
-type GeoPoint = { lat: number; lng: number; id: number; timestamp: number };
+type GeoPoint = { lat: number; lng: number; alt: number | null; timestamp: number };
 
 type UnitSystem = 'metric' | 'imperial';
 
@@ -82,6 +87,12 @@ const convertTemp = (celsius: number, system: UnitSystem): string => {
   return system === 'metric'
     ? `${celsius.toFixed(1)}°`
     : `${((celsius * 9/5) + 32).toFixed(1)}°`;
+};
+
+const formatTime = (isoString: string) => {
+  if (!isoString) return "--:--";
+  const date = new Date(isoString);
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 };
 
 const getWeatherInfo = (code: number) => {
@@ -131,7 +142,59 @@ const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: num
   return { x: point.x - anchor.x, y: point.y - anchor.y };
 };
 
+// GPX Generator
+const generateGPX = (points: GeoPoint[]) => {
+  const header = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="FieldNavApp" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Mission Log ${new Date().toISOString()}</name>
+    <trkseg>`;
+  
+  const footer = `
+    </trkseg>
+  </trk>
+</gpx>`;
+
+  const body = points.map(p => `
+      <trkpt lat="${p.lat}" lon="${p.lng}">
+        ${p.alt !== null ? `<ele>${p.alt.toFixed(2)}</ele>` : ''}
+        <time>${new Date(p.timestamp).toISOString()}</time>
+      </trkpt>`).join('');
+
+  return header + body + footer;
+};
+
 // --- Hooks ---
+const useWakeLock = () => {
+  useEffect(() => {
+    let wakeLock: any = null;
+    
+    const requestLock = async () => {
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await (navigator as any).wakeLock.request('screen');
+        }
+      } catch (err) {
+        // Wake lock denied or not supported
+      }
+    };
+
+    requestLock();
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        requestLock();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      if (wakeLock) wakeLock.release().catch(() => {});
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
+};
 
 const useGeolocation = () => {
   const [state, setState] = useState<GeoState>({ coords: null, error: null, loading: true });
@@ -145,11 +208,13 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
+      // Throttle updates slightly to prevent render thrashing
       if (now - lastUpdate.current < 500) return;
       if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
       lastUpdate.current = now;
 
       setState(prev => {
+        // Deep comparison to avoid unnecessary state updates
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
@@ -226,10 +291,13 @@ const useCompass = () => {
     } else { setPermissionGranted(true); }
   }, []);
 
+  // Animation Loop for Smooth Compass
   useEffect(() => {
     if (!permissionGranted) return;
     const loop = () => {
       const diff = targetRef.current - currentRef.current;
+      
+      // Stop animation if close enough
       if (Math.abs(diff) < 0.1) {
          isAnimating.current = false;
          if (currentRef.current !== targetRef.current) {
@@ -238,10 +306,13 @@ const useCompass = () => {
          }
          return;
       }
+      
+      // Interpolate
       currentRef.current += diff * 0.15;
       setVisualHeading((currentRef.current % 360 + 360) % 360);
       rafIdRef.current = requestAnimationFrame(loop);
     };
+
     if (isAnimating.current) rafIdRef.current = requestAnimationFrame(loop);
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [permissionGranted, trueHeading]);
@@ -258,16 +329,21 @@ const useCompass = () => {
       if (degree !== null) {
         const normalized = ((degree) + 360) % 360;
         setTrueHeading(normalized);
+        
+        // Shortest path interpolation logic
         const current = targetRef.current;
         const currentMod = (current % 360 + 360) % 360;
         let delta = normalized - currentMod;
+        
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
+        
         if (Math.abs(delta) > 0.5) {
           targetRef.current = current + delta;
           if (!isAnimating.current) {
              isAnimating.current = true;
              rafIdRef.current = requestAnimationFrame(() => {
+                 // Restart loop if it was stopped
                  const diff = targetRef.current - currentRef.current;
                  currentRef.current += diff * 0.15;
                  setVisualHeading((currentRef.current % 360 + 360) % 360);
@@ -350,43 +426,29 @@ const RadarMapbox = memo(({
 
   return (
     <div className="relative w-60 h-60 md:w-80 md:h-80 shrink-0 transition-all duration-300">
-      <div className="absolute inset-0 rounded-full bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
-      
-      {/* 
-         FIX: Separation of concerns. 
-         1. The container defines the shape.
-         2. The inner div (absolute) handles the mask and clipping.
-         3. The border sits ON TOP (absolute) so it isn't clipped by the mask.
-      */}
+      <div className="absolute inset-0 rounded-full border border-border/20 bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
       <div className="w-full h-full relative isolate">
         
-        {/* CLIPPING CONTAINER - This enforces the circle shape on the map */}
         <div 
           className="absolute inset-0 rounded-full overflow-hidden bg-black z-0"
           style={{ 
-             // This is the key fix for mobile browsers: Strict masking
              WebkitMaskImage: '-webkit-radial-gradient(white, black)',
              maskImage: 'radial-gradient(white, black)',
-             transform: 'translateZ(0)' // Force GPU layer
+             transform: 'translateZ(0)'
           }}
         >
-          {/* Rotating Map Layer */}
           <div 
             className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear origin-center"
-            style={{ transform: `rotate(${-rotation}deg) scale(1.02)` }} // Scale slightly to avoid subpixel bleeding
+            style={{ transform: `rotate(${-rotation}deg) scale(1.02)` }} 
           >
-            {/* Tile Layer */}
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[220%] h-[220%]">
                <div className="absolute inset-0 bg-[#0a0f0a]" />
-               
-               {/* Grid Fallback */}
                <div className={`absolute inset-0 opacity-15 transition-opacity duration-300 ${(!imgLoaded || mapError) ? 'opacity-30' : ''}`}
                  style={{ 
                    backgroundImage: 'linear-gradient(#22c55e 1px, transparent 1px), linear-gradient(90deg, #22c55e 1px, transparent 1px)', 
                    backgroundSize: '40px 40px' 
                  }} 
                />
-               
                {!mapError && (
                  <img
                    src={mapUrl}
@@ -398,8 +460,6 @@ const RadarMapbox = memo(({
                  />
                )}
             </div>
-
-            {/* User Trail & Marker */}
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
               <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
                 {svgPath && (
@@ -417,29 +477,20 @@ const RadarMapbox = memo(({
           </div>
         </div>
 
-        {/* BORDER & OVERLAYS - Sit outside the clipped container */}
         <div className="absolute inset-0 rounded-full border-4 border-muted/20 pointer-events-none z-10" />
-        
-        {/* HUD Elements */}
         <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20 rounded-full" />
         <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
-        
-        {/* Radar Sweep */}
         <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden z-20">
              <div className="absolute inset-0 bg-[conic-gradient(from_0deg,transparent_0deg,transparent_280deg,rgba(34,197,94,0.15)_360deg)] animate-[spin_4s_linear_infinite]" />
         </div>
 
-        {/* Reticle */}
         <div className="absolute inset-0 pointer-events-none z-30">
-           {/* Center Crosshair */}
            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 opacity-50">
               <div className="absolute top-1/2 left-0 w-2 h-px bg-green-500" />
               <div className="absolute top-1/2 right-0 w-2 h-px bg-green-500" />
               <div className="absolute top-0 left-1/2 h-2 w-px bg-green-500" />
               <div className="absolute bottom-0 left-1/2 h-2 w-px bg-green-500" />
            </div>
-
-          {/* North Indicator */}
           <div className="absolute top-3 left-1/2 -translate-x-1/2 text-[10px] font-black text-red-500 bg-black/50 px-2 rounded-full backdrop-blur-sm border border-red-500/30"
                style={{ transform: `rotate(${-rotation}deg)`, transformOrigin: 'center 110px' }}>N</div>
         </div>
@@ -575,6 +626,76 @@ const StatCard = memo(({ icon: Icon, label, value, subValue, unit }: { icon: any
   </div>
 ));
 StatCard.displayName = "StatCard";
+
+// Solar Intel Card with enhanced logic for next-day sunrise
+const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string[] }) => {
+  const now = new Date().getTime();
+  
+  // Parse today's and tomorrow's events
+  const riseToday = new Date(sunrise[0]).getTime();
+  const setToday = new Date(sunset[0]).getTime();
+  const riseTomorrow = new Date(sunrise[1]).getTime();
+
+  let isDay = false;
+  let nextEventLabel = "Sunrise";
+  let nextEventTime = riseToday;
+  let progress = 0;
+
+  if (now < riseToday) {
+    // Before dawn today
+    isDay = false;
+    nextEventLabel = "Sunrise";
+    nextEventTime = riseToday;
+    const nightLength = riseToday - (new Date(sunset[0]).getTime() - 86400000); // Approximate prev sunset
+    progress = 100 - ((riseToday - now) / nightLength) * 100;
+  } else if (now >= riseToday && now < setToday) {
+    // Daytime
+    isDay = true;
+    nextEventLabel = "Sunset";
+    nextEventTime = setToday;
+    const dayLength = setToday - riseToday;
+    progress = ((now - riseToday) / dayLength) * 100;
+  } else {
+    // After sunset today
+    isDay = false;
+    nextEventLabel = "Sunrise";
+    nextEventTime = riseTomorrow;
+    const nightLength = riseTomorrow - setToday;
+    progress = ((now - setToday) / nightLength) * 100;
+  }
+
+  // Clamping
+  progress = Math.min(Math.max(progress, 0), 100);
+
+  return (
+    <div className="p-4 rounded-2xl bg-gradient-to-br from-amber-500/10 to-blue-900/10 border border-white/5 backdrop-blur-sm w-full shadow-sm space-y-3">
+      <div className="flex items-center justify-between opacity-80">
+         <div className="flex items-center gap-2">
+            {isDay ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-blue-300" />}
+            <span className="text-[10px] uppercase font-bold tracking-widest">{isDay ? "Daylight Ops" : "Night Ops"}</span>
+         </div>
+         <span className="text-[10px] font-mono opacity-60">
+           {formatTime(new Date(nextEventTime).toISOString())} {nextEventLabel === "Sunset" ? "SET" : "RISE"}
+         </span>
+      </div>
+      
+      {/* Visual Day Progress */}
+      <div className="relative w-full h-2 bg-black/40 rounded-full overflow-hidden">
+         <div className={`absolute inset-0 opacity-20 ${isDay ? 'bg-gradient-to-r from-amber-900 via-amber-500 to-amber-900' : 'bg-gradient-to-r from-blue-900 via-blue-500 to-blue-900'}`} />
+         <div 
+            className={`absolute top-0 bottom-0 left-0 shadow-[0_0_10px_rgba(255,255,255,0.3)] ${isDay ? 'bg-amber-500' : 'bg-blue-500'}`} 
+            style={{ width: `${progress}%` }}
+         />
+      </div>
+
+      <div className="flex justify-between text-[9px] font-mono text-muted-foreground uppercase">
+         <div className="flex items-center gap-1"><Sunrise className="w-3 h-3" /> {formatTime(sunrise[0])}</div>
+         <div className="flex items-center gap-1">{formatTime(sunset[0])} <Sunset className="w-3 h-3" /></div>
+      </div>
+    </div>
+  );
+});
+SolarCard.displayName = "SolarCard";
 
 const CoordinateRow = memo(({ 
   label, 
@@ -713,6 +834,8 @@ FullMapDrawer.displayName = "FullMapDrawer";
 export default function GeoLocation() {
   const { coords, error, loading } = useGeolocation();
   const { heading, trueHeading, requestAccess, permissionGranted, error: compassError } = useCompass();
+  useWakeLock(); // Prevent screen sleep
+
   const [address, setAddress] = useState<string | null>(null);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [path, setPath] = useState<GeoPoint[]>([]);
@@ -721,6 +844,11 @@ export default function GeoLocation() {
   const [lastApiFetch, setLastApiFetch] = useState<{lat: number, lng: number} | null>(null);
   const [mounted, setMounted] = useState(false);
   const [isMapDrawerOpen, setIsMapDrawerOpen] = useState(false);
+  
+  // -- New States for Recording --
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedPath, setRecordedPath] = useState<GeoPoint[]>([]);
+  const [showSaveButton, setShowSaveButton] = useState(false);
   
   const isMountedRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -731,10 +859,30 @@ export default function GeoLocation() {
     return () => { isMountedRef.current = false; };
   }, []);
 
+  // Prevent accidental close while recording
+  useEffect(() => {
+    if (!isRecording) return;
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isRecording]);
+
   useEffect(() => {
     if (!coords) return;
+
+    const newPoint = { 
+      lat: coords.latitude, 
+      lng: coords.longitude, 
+      alt: coords.altitude, 
+      // id removed to match GeoPoint type
+      timestamp: Date.now() 
+    };
+
+    // Update visual path (limited trail)
     setPath(prev => {
-      const newPoint = { lat: coords.latitude, lng: coords.longitude, id: Date.now(), timestamp: Date.now() };
       if (prev.length === 0) return [newPoint];
       const last = prev[prev.length - 1];
       const distance = getDistance(last.lat, last.lng, coords.latitude, coords.longitude);
@@ -744,10 +892,48 @@ export default function GeoLocation() {
       }
       return prev;
     });
-  }, [coords]);
+
+    // Handle Background Recording (Unlimited trail)
+    if (isRecording) {
+      setRecordedPath(prev => [...prev, newPoint]);
+    }
+
+  }, [coords, isRecording]);
+
+  const toggleRecording = useCallback(() => {
+    triggerHaptic();
+    if (isRecording) {
+      // Stop recording
+      setIsRecording(false);
+      if (recordedPath.length > 0) setShowSaveButton(true);
+    } else {
+      // Start recording
+      setRecordedPath([]); 
+      setShowSaveButton(false);
+      setIsRecording(true);
+    }
+  }, [isRecording, recordedPath]);
+
+  const downloadGPX = useCallback(() => {
+    triggerHaptic();
+    if (recordedPath.length === 0) return;
+    
+    const gpxString = generateGPX(recordedPath);
+    const blob = new Blob([gpxString], { type: 'application/gpx+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mission-log-${new Date().toISOString().slice(0,19).replace(/:/g, '-')}.gpx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    setShowSaveButton(false); 
+  }, [recordedPath]);
 
   const resetRadar = useCallback(() => { 
-    if (coords) setPath([{ lat: coords.latitude, lng: coords.longitude, id: Date.now(), timestamp: Date.now() }]); 
+    if (coords) setPath([{ lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() }]); 
   }, [coords]);
 
   const recenterMap = useCallback(() => resetRadar(), [resetRadar]);
@@ -771,9 +957,10 @@ export default function GeoLocation() {
         const { latitude, longitude } = debouncedCoords;
         const signal = abortControllerRef.current?.signal;
         
+        // Fetch 2 days of daily data for solar cycle logic
         const [geoRes, weatherRes] = await Promise.allSettled([
           fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=14`, { signal }),
-          fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code&timezone=auto`, { signal })
+          fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m&daily=sunrise,sunset&forecast_days=2&timezone=auto`, { signal })
         ]);
         
         if (signal?.aborted || !isMountedRef.current) return;
@@ -793,7 +980,15 @@ export default function GeoLocation() {
           try {
             const data = await weatherRes.value.json();
             const info = getWeatherInfo(data.current.weather_code);
-            setWeather({ temp: data.current.temperature_2m, code: data.current.weather_code, description: info.label });
+            setWeather({ 
+              temp: data.current.temperature_2m, 
+              code: data.current.weather_code, 
+              description: info.label,
+              windSpeed: data.current.wind_speed_10m,
+              windDir: data.current.wind_direction_10m,
+              sunrise: data.daily.sunrise, // Array
+              sunset: data.daily.sunset    // Array
+            });
           } catch (e) {}
         }
         
@@ -828,13 +1023,29 @@ export default function GeoLocation() {
                  <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">{coords ? "Live Data" : "Offline"}</span>
              </div>
          </div>
-         <button 
-           onClick={toggleUnits} 
-           type="button"
-           className="px-3 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground transition-all active:scale-95"
-         >
-           {units === 'metric' ? 'MET' : 'IMP'}
-         </button>
+
+         <div className="flex gap-2">
+            {/* RECORD BUTTON */}
+            <button
+               onClick={toggleRecording}
+               className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all active:scale-95 ${
+                 isRecording 
+                   ? "bg-red-500/10 border-red-500/50 text-red-500" 
+                   : "bg-white/5 border-white/5 text-muted-foreground hover:bg-white/10"
+               }`}
+            >
+               {isRecording ? <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> : <Circle className="w-2 h-2" />}
+               {isRecording ? "REC" : "LOG"}
+            </button>
+
+             <button 
+               onClick={toggleUnits} 
+               type="button"
+               className="px-3 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground transition-all active:scale-95"
+             >
+               {units === 'metric' ? 'MET' : 'IMP'}
+             </button>
+         </div>
       </div>
 
       <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 z-10">
@@ -852,6 +1063,18 @@ export default function GeoLocation() {
              <AlertTitle>GPS Signal Lost</AlertTitle>
              <AlertDescription>{error}. Check device permissions.</AlertDescription>
            </Alert>
+        )}
+
+        {/* SAVE GPX BUTTON OVERLAY */}
+        {showSaveButton && !isRecording && (
+          <div className="w-full max-w-md animate-in slide-in-from-top-4 fade-in">
+             <button 
+               onClick={downloadGPX}
+               className="w-full py-4 rounded-xl bg-green-500 text-black font-bold uppercase tracking-widest shadow-[0_0_20px_rgba(34,197,94,0.4)] flex items-center justify-center gap-2 active:scale-95 transition-transform"
+             >
+                <Download className="w-5 h-5" /> Download Mission Log
+             </button>
+          </div>
         )}
 
         {coords && (
@@ -885,6 +1108,11 @@ export default function GeoLocation() {
                     <StatCard icon={Navigation} label="Acc" value={coords.accuracy ? `±${Math.round(coords.accuracy)}` : '--'} unit="m" />
                  </div>
 
+                 {/* NEW: Solar Intel Card */}
+                 {weather && weather.sunrise && (
+                    <SolarCard sunrise={weather.sunrise} sunset={weather.sunset} />
+                 )}
+
                  {/* Weather Pill */}
                  {weather && (
                    <div className="flex items-center justify-between p-4 rounded-2xl bg-gradient-to-r from-blue-500/10 to-transparent border border-blue-500/10">
@@ -894,7 +1122,14 @@ export default function GeoLocation() {
                           </div>
                           <div className="flex flex-col">
                              <span className="text-lg font-bold tabular-nums leading-none">{convertTemp(weather.temp, units)}</span>
-                             <span className="text-[9px] uppercase font-bold text-muted-foreground tracking-wide mt-1">{weather.description}</span>
+                             <div className="flex items-center gap-2 mt-1">
+                               <span className="text-[9px] uppercase font-bold text-muted-foreground tracking-wide">{weather.description}</span>
+                               <span className="text-[9px] text-muted-foreground/50">•</span>
+                               <div className="flex items-center gap-1 text-[9px] font-bold text-muted-foreground">
+                                  <Wind className="w-3 h-3" />
+                                  {convertSpeed(weather.windSpeed / 3.6, units)}
+                               </div>
+                             </div>
                           </div>
                       </div>
                       <div className="text-right">
