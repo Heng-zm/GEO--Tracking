@@ -1,4 +1,3 @@
-
 "use client";
 
 import React, { useState, useEffect, useRef, useMemo, memo, useCallback } from 'react';
@@ -7,17 +6,19 @@ import {
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, ExternalLink, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
-  Plus, Minus
+  Plus, Minus, Play, Square
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 // --- Configuration ---
+// Note: In a production app, proxy this token through a backend to prevent exposure.
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 const RADAR_ZOOM = 18;
 const TRAIL_MAX_POINTS = 100; // Visual trail only
 const TRAIL_MIN_DISTANCE = 5; 
-const MAP_UPDATE_THRESHOLD = 40; 
-const API_FETCH_DISTANCE_THRESHOLD = 0.5; 
+const MAP_UPDATE_THRESHOLD = 100; // Increased to 100m to prevent constant tile reloading
+const API_FETCH_DISTANCE_THRESHOLD = 1.0; // Fetch weather/address every 1km
+const REC_MIN_DISTANCE = 3; // Minimum meters to move to record a GPX point (noise reduction)
 
 // --- Types ---
 type Coordinates = {
@@ -172,7 +173,7 @@ const useWakeLock = () => {
     
     const requestLock = async () => {
       try {
-        if ('wakeLock' in navigator) {
+        if ('wakeLock' in navigator && document.visibilityState === 'visible') {
           wakeLock = await (navigator as any).wakeLock.request('screen');
         }
       } catch (err) {
@@ -185,6 +186,9 @@ const useWakeLock = () => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         requestLock();
+      } else if (wakeLock) {
+        wakeLock.release().catch(() => {});
+        wakeLock = null;
       }
     };
 
@@ -245,7 +249,7 @@ const useGeolocation = () => {
       switch(error.code) {
         case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
         case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return;
+        case error.TIMEOUT: return; // Don't wipe state on timeout, wait for next
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
@@ -268,14 +272,41 @@ const useCompass = () => {
   const targetRef = useRef<number>(0);
   const currentRef = useRef<number>(0);
   const rafIdRef = useRef<number | null>(null);
-  const isAnimating = useRef(false);
-
+  
+  // Animation Loop for Smooth Compass
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS)?.requestPermission === 'function';
-      if (!isIOS) setPermissionGranted(true);
-    }
-  }, []);
+    if (!permissionGranted) return;
+    
+    let isRunning = true;
+    
+    const loop = () => {
+      if (!isRunning) return;
+
+      const diff = targetRef.current - currentRef.current;
+      
+      // Stop animation if close enough to save battery
+      if (Math.abs(diff) < 0.05) {
+         if (currentRef.current !== targetRef.current) {
+            currentRef.current = targetRef.current;
+            setVisualHeading((currentRef.current % 360 + 360) % 360);
+         }
+         rafIdRef.current = requestAnimationFrame(loop);
+         return;
+      }
+      
+      // Interpolate with ease
+      currentRef.current += diff * 0.15;
+      setVisualHeading((currentRef.current % 360 + 360) % 360);
+      rafIdRef.current = requestAnimationFrame(loop);
+    };
+
+    rafIdRef.current = requestAnimationFrame(loop);
+    
+    return () => { 
+      isRunning = false;
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); 
+    };
+  }, [permissionGranted]);
 
   const requestAccess = useCallback(async () => {
     triggerHaptic();
@@ -289,49 +320,33 @@ const useCompass = () => {
         const response = await (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission!();
         if (response === 'granted') { setPermissionGranted(true); setError(null); } else { setError("Denied"); }
       } catch (e) { setError("Not supported"); }
-    } else { setPermissionGranted(true); }
+    } else { 
+      setPermissionGranted(true); 
+    }
   }, []);
-
-  // Animation Loop for Smooth Compass
-  useEffect(() => {
-    if (!permissionGranted) return;
-    const loop = () => {
-      const diff = targetRef.current - currentRef.current;
-      
-      // Stop animation if close enough
-      if (Math.abs(diff) < 0.1) {
-         isAnimating.current = false;
-         if (currentRef.current !== targetRef.current) {
-            currentRef.current = targetRef.current;
-            setVisualHeading((currentRef.current % 360 + 360) % 360);
-         }
-         return;
-      }
-      
-      // Interpolate
-      currentRef.current += diff * 0.15;
-      setVisualHeading((currentRef.current % 360 + 360) % 360);
-      rafIdRef.current = requestAnimationFrame(loop);
-    };
-
-    if (isAnimating.current) rafIdRef.current = requestAnimationFrame(loop);
-    return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
-  }, [permissionGranted, trueHeading]);
 
   useEffect(() => {
     if (!permissionGranted || typeof window === 'undefined') return;
+
     const handleOrientation = (e: any) => {
       let degree: number | null = null;
+      
+      // iOS
       if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
         degree = e.webkitCompassHeading;
-      } else if (e.alpha !== null) {
+      } 
+      // Android / Standards
+      else if (e.alpha !== null) {
+        // Android absolute orientation often needs the offset
+        // This is a simplified fallback; actual absolute orientation on Android can be complex
         degree = Math.abs(360 - e.alpha);
       }
+
       if (degree !== null) {
         const normalized = ((degree) + 360) % 360;
         setTrueHeading(normalized);
         
-        // Shortest path interpolation logic
+        // Shortest path interpolation logic for the animator
         const current = targetRef.current;
         const currentMod = (current % 360 + 360) % 360;
         let delta = normalized - currentMod;
@@ -339,23 +354,14 @@ const useCompass = () => {
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
         
-        if (Math.abs(delta) > 0.5) {
-          targetRef.current = current + delta;
-          if (!isAnimating.current) {
-             isAnimating.current = true;
-             rafIdRef.current = requestAnimationFrame(() => {
-                 // Restart loop if it was stopped
-                 const diff = targetRef.current - currentRef.current;
-                 currentRef.current += diff * 0.15;
-                 setVisualHeading((currentRef.current % 360 + 360) % 360);
-                 if (Math.abs(diff) > 0.1) isAnimating.current = true; 
-             });
-          }
-        }
+        targetRef.current = current + delta;
       }
     };
+
+    // Prefer deviceorientationabsolute if available (Android)
     const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
     window.addEventListener(eventName, handleOrientation, true);
+    
     return () => window.removeEventListener(eventName, handleOrientation, true);
   }, [permissionGranted]);
 
@@ -394,18 +400,31 @@ const RadarMapbox = memo(({
   const [isOffCenter, setIsOffCenter] = useState(false);
   const [imgLoaded, setImgLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
+  const [displayMapUrl, setDisplayMapUrl] = useState("");
 
+  // Map tile loading strategy
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
-    setIsOffCenter(distance > 10);
+    setIsOffCenter(distance > 25); // Show button if 25m away from center tile
+
+    // Only update the anchor (and trigger a new image load) if we moved significantly
     if (distance > MAP_UPDATE_THRESHOLD) {
+      const newUrl = `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${lng},${lat},${RADAR_ZOOM},0,0/500x500@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`;
       setAnchor({ lat, lng });
-      setImgLoaded(false);
+      setImgLoaded(false); 
       setMapError(false);
     }
   }, [lat, lng, anchor]);
 
-  const mapUrl = useMemo(() => 
+  // Initial load
+  useEffect(() => {
+    if (!displayMapUrl) {
+      setDisplayMapUrl(`https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${lng},${lat},${RADAR_ZOOM},0,0/500x500@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`);
+    }
+  }, []);
+
+  // Update URL based on anchor change
+  const currentMapUrl = useMemo(() => 
     `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/500x500@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
   [anchor.lat, anchor.lng]);
 
@@ -452,11 +471,11 @@ const RadarMapbox = memo(({
                />
                {!mapError && (
                  <img
-                   src={mapUrl}
+                   src={currentMapUrl}
                    alt="Satellite View"
                    onLoad={() => setImgLoaded(true)}
                    onError={() => setMapError(true)}
-                   className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+                   className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-40'}`}
                    style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.8)' }}
                  />
                )}
@@ -632,7 +651,6 @@ StatCard.displayName = "StatCard";
 const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string[] }) => {
   const now = new Date().getTime();
   
-  // Parse today's and tomorrow's events
   const riseToday = new Date(sunrise[0]).getTime();
   const setToday = new Date(sunset[0]).getTime();
   const riseTomorrow = new Date(sunrise[1]).getTime();
@@ -647,7 +665,8 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
     isDay = false;
     nextEventLabel = "Sunrise";
     nextEventTime = riseToday;
-    const nightLength = riseToday - (new Date(sunset[0]).getTime() - 86400000); // Approximate prev sunset
+    const prevSunset = setToday - (24 * 3600 * 1000); // Approximate yesterday's sunset
+    const nightLength = riseToday - prevSunset;
     progress = 100 - ((riseToday - now) / nightLength) * 100;
   } else if (now >= riseToday && now < setToday) {
     // Daytime
@@ -685,7 +704,7 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
          <div className={`absolute inset-0 opacity-20 ${isDay ? 'bg-gradient-to-r from-amber-900 via-amber-500 to-amber-900' : 'bg-gradient-to-r from-blue-900 via-blue-500 to-blue-900'}`} />
          <div 
             className={`absolute top-0 bottom-0 left-0 shadow-[0_0_10px_rgba(255,255,255,0.3)] ${isDay ? 'bg-amber-500' : 'bg-blue-500'}`} 
-            style={{ width: `${progress}%` }}
+            style={{ width: `${progress}%`, transition: 'width 1s linear' }}
          />
       </div>
 
@@ -759,8 +778,6 @@ const FullMapDrawer = memo(({
   const [imgLoaded, setImgLoaded] = useState(false);
 
   // Generate Mapbox Static URL with Pin Overlay
-  // Using satellite-streets-v12 style to match the rest of the app
-  // Overlay: pin-l+ef4444 (large red pin)
   const mapUrl = useMemo(() => 
     `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/pin-l+ef4444(${lng},${lat})/${lng},${lat},${viewZoom},0,0/600x800@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
   [lat, lng, viewZoom]);
@@ -788,48 +805,61 @@ const FullMapDrawer = memo(({
   return (
     <>
       <div 
-        className={`fixed inset-0 bg-black/60 backdrop-blur-sm z-50 transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} 
+        className={`fixed inset-0 bg-black/80 backdrop-blur-sm z-[60] transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} 
         onClick={onClose}
       />
       
-      <div className={`fixed bottom-0 left-0 right-0 h-[85vh] bg-background/95 backdrop-blur-xl border-t border-border/20 rounded-t-3xl shadow-2xl z-[51] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
+      <div className={`fixed bottom-0 left-0 right-0 h-[90vh] bg-background/95 backdrop-blur-xl border-t border-border/20 rounded-t-3xl shadow-2xl z-[61] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
         
+        {/* --- Top Gradient Overlay for Text Readability --- */}
+        <div className="absolute top-0 left-0 right-0 h-32 bg-gradient-to-b from-black/90 via-black/40 to-transparent z-[62] pointer-events-none rounded-t-3xl" />
+
+        {/* --- Bottom Gradient Overlay for Buttons --- */}
+        <div className="absolute bottom-0 left-0 right-0 h-40 bg-gradient-to-t from-black/90 via-black/60 to-transparent z-[62] pointer-events-none" />
+
         {/* Handle */}
-        <div className="absolute top-0 left-0 right-0 h-8 flex items-center justify-center z-[52] pointer-events-none" onClick={onClose}>
-          <div className="w-12 h-1.5 bg-muted-foreground/20 rounded-full" />
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 w-12 h-1.5 bg-white/20 rounded-full z-[63] pointer-events-none" />
+
+        {/* Map Header Info */}
+        <div className="absolute top-8 left-6 z-[63] pointer-events-none text-shadow-sm">
+            <h3 className="text-xl font-bold text-white tracking-tight drop-shadow-md">Satellite View</h3>
+            <div className="flex items-center gap-2 mt-1">
+               <span className="px-1.5 py-0.5 rounded bg-white/10 border border-white/10 text-[10px] font-mono text-white/80 backdrop-blur-md">
+                 {lat.toFixed(5)}, {lng.toFixed(5)}
+               </span>
+            </div>
         </div>
 
-        {/* Map Header */}
-        <div className="absolute top-4 left-6 z-[53] pointer-events-none">
-            <h3 className="text-lg font-bold text-foreground/80 drop-shadow-md">Satellite View</h3>
-            <p className="text-xs text-muted-foreground font-mono">{lat.toFixed(4)}, {lng.toFixed(4)}</p>
+        {/* Close Button */}
+        <button 
+          onClick={onClose} 
+          className="absolute top-6 right-6 z-[63] p-2.5 rounded-full bg-black/20 hover:bg-black/40 backdrop-blur-xl border border-white/10 text-white transition-all active:scale-90"
+        >
+           <X className="w-5 h-5" />
+        </button>
+
+        {/* Zoom Controls (Right aligned, vertical pill) */}
+        <div className="absolute top-1/2 right-4 -translate-y-1/2 z-[63] flex flex-col gap-3">
+           <div className="flex flex-col bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden shadow-xl">
+             <button onClick={handleZoomIn} className="p-3.5 text-white hover:bg-white/10 active:bg-white/20 transition-colors border-b border-white/5">
+                <Plus className="w-6 h-6" />
+             </button>
+             <button onClick={handleZoomOut} className="p-3.5 text-white hover:bg-white/10 active:bg-white/20 transition-colors">
+                <Minus className="w-6 h-6" />
+             </button>
+           </div>
         </div>
 
-        {/* Controls Overlay */}
-        <div className="absolute top-4 right-4 z-[53] flex flex-col gap-2">
-           <button onClick={onClose} className="p-3 rounded-full bg-black/40 backdrop-blur-md border border-white/10 text-white active:scale-95 transition-transform" aria-label="Close Map">
-              <X className="w-5 h-5" />
-           </button>
-        </div>
-
-        {/* Zoom Controls */}
-        <div className="absolute top-1/2 right-4 -translate-y-1/2 z-[53] flex flex-col gap-2">
-           <button onClick={handleZoomIn} className="p-3 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-white active:scale-95 transition-transform shadow-lg">
-              <Plus className="w-5 h-5" />
-           </button>
-           <button onClick={handleZoomOut} className="p-3 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-white active:scale-95 transition-transform shadow-lg">
-              <Minus className="w-5 h-5" />
-           </button>
-        </div>
-
-        {/* Action Bar */}
-        <div className="absolute bottom-8 left-4 right-4 z-[53] flex gap-3 pb-safe">
-            <button onClick={openAppleMaps} className="flex-1 py-3 rounded-xl bg-white text-black font-bold text-sm shadow-lg active:scale-95 transition-transform flex items-center justify-center gap-2">
-                <MapPin className="w-4 h-4" /> Apple Maps
-            </button>
-            <button onClick={openGoogleMaps} className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-bold text-sm shadow-lg active:scale-95 transition-transform flex items-center justify-center gap-2">
-                <LocateFixed className="w-4 h-4" /> Google Maps
-            </button>
+        {/* Bottom Action Buttons */}
+        <div className="absolute bottom-10 left-6 right-6 z-[63] flex flex-col gap-3">
+            <div className="grid grid-cols-2 gap-3">
+                <button onClick={openAppleMaps} className="flex items-center justify-center gap-2 py-3.5 rounded-2xl bg-white text-black font-bold text-sm shadow-xl active:scale-[0.98] transition-transform">
+                    <MapPin className="w-4 h-4 fill-current" /> <span>Apple Maps</span>
+                </button>
+                <button onClick={openGoogleMaps} className="flex items-center justify-center gap-2 py-3.5 rounded-2xl bg-[#4285F4] text-white font-bold text-sm shadow-xl active:scale-[0.98] transition-transform">
+                    <LocateFixed className="w-4 h-4" /> <span>Google Maps</span>
+                </button>
+            </div>
         </div>
 
         <div className="w-full h-full rounded-t-3xl overflow-hidden relative bg-[#1a1a1a] mt-0 pt-0">
@@ -846,9 +876,9 @@ const FullMapDrawer = memo(({
              <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
           </div>
           
-          {/* Map Grid Overlay for aesthetics */}
-          <div className="absolute inset-0 pointer-events-none opacity-20"
-               style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '100px 100px' }} />
+          {/* Map Grid Overlay for aesthetics - reduced opacity */}
+          <div className="absolute inset-0 pointer-events-none opacity-10"
+               style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '80px 80px' }} />
         </div>
       </div>
     </>
@@ -902,7 +932,6 @@ export default function GeoLocation() {
       lat: coords.latitude, 
       lng: coords.longitude, 
       alt: coords.altitude, 
-      // id removed to match GeoPoint type
       timestamp: Date.now() 
     };
 
@@ -911,6 +940,8 @@ export default function GeoLocation() {
       if (prev.length === 0) return [newPoint];
       const last = prev[prev.length - 1];
       const distance = getDistance(last.lat, last.lng, coords.latitude, coords.longitude);
+      
+      // Update trail if we moved enough
       if (distance > TRAIL_MIN_DISTANCE) {
         const newPath = [...prev, newPoint];
         return newPath.length > TRAIL_MAX_POINTS ? newPath.slice(newPath.length - TRAIL_MAX_POINTS) : newPath;
@@ -918,9 +949,19 @@ export default function GeoLocation() {
       return prev;
     });
 
-    // Handle Background Recording (Unlimited trail)
+    // Handle Background Recording (Unlimited trail, strict noise filter)
     if (isRecording) {
-      setRecordedPath(prev => [...prev, newPoint]);
+      setRecordedPath(prev => {
+        if (prev.length === 0) return [newPoint];
+        const last = prev[prev.length - 1];
+        const dist = getDistance(last.lat, last.lng, newPoint.lat, newPoint.lng);
+        
+        // NOISE REDUCTION: Only record if moved > REC_MIN_DISTANCE
+        if (dist >= REC_MIN_DISTANCE) {
+            return [...prev, newPoint];
+        }
+        return prev;
+      });
     }
 
   }, [coords, isRecording]);
@@ -967,8 +1008,11 @@ export default function GeoLocation() {
 
   const debouncedCoords = useDebounce(coords, 2000);
 
+  // Fetch Weather / Address
   useEffect(() => {
     if (!debouncedCoords) return;
+    
+    // Skip fetch if we haven't moved far enough to care (e.g., < 1km)
     if (lastApiFetch) {
         const distKm = getDistance(lastApiFetch.lat, lastApiFetch.lng, debouncedCoords.latitude, debouncedCoords.longitude) / 1000;
         if (distKm < API_FETCH_DISTANCE_THRESHOLD && address && weather) return;
@@ -1023,7 +1067,7 @@ export default function GeoLocation() {
       }
     };
     fetchData();
-    return () => { if (abortControllerRef.current) abortControllerRef.current.abort(); };
+    // Cleanup is handled by new abort controller on next run
   }, [debouncedCoords, lastApiFetch, address, weather]);
 
   const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
@@ -1133,7 +1177,7 @@ export default function GeoLocation() {
                     <StatCard icon={Navigation} label="Acc" value={coords.accuracy ? `±${Math.round(coords.accuracy)}` : '--'} unit="m" />
                  </div>
 
-                 {/* NEW: Solar Intel Card */}
+                 {/* Solar Intel Card */}
                  {weather && weather.sunrise && (
                     <SolarCard sunrise={weather.sunrise} sunset={weather.sunset} />
                  )}
