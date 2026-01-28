@@ -4,13 +4,11 @@ import React, { useState, useEffect, useRef, useMemo, memo, useCallback } from '
 import { 
   Sun, Cloud, CloudRain, CloudLightning, Snowflake, CloudFog, CloudSun,
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
-  Trash2, Crosshair, Thermometer, Compass as CompassIcon, RotateCcw,
-  WifiOff
+  Trash2, Crosshair, Compass as CompassIcon, WifiOff
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 // --- Configuration ---
-// Note: Ensure this token has Static Images API permissions.
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 const RADAR_ZOOM = 18;
 const TRAIL_MAX_POINTS = 100;
@@ -105,12 +103,26 @@ const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => 
   return R * c;
 };
 
+// Precise Web Mercator Projection for Mapbox
+// Converts Lat/Lng to Pixel coordinates relative to the center anchor at specific zoom
 const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: number, zoom: number) => {
-  const earthCircumference = 40075016.686;
-  const metersPerPx = (earthCircumference * Math.cos(anchorLat * Math.PI / 180)) / Math.pow(2, zoom + 8);
-  const dLat = (lat - anchorLat) * 111319.9; 
-  const dLng = (lng - anchorLng) * 111319.9 * Math.cos(anchorLat * Math.PI / 180);
-  return { x: dLng / metersPerPx, y: -dLat / metersPerPx };
+  const TILE_SIZE = 512; // Mapbox static tiles are 512x512 @2x usually, but math works on base 256 logic scaled up
+  const worldSize = TILE_SIZE * Math.pow(2, zoom);
+
+  const project = (lat: number, lng: number) => {
+    let siny = Math.sin((lat * Math.PI) / 180);
+    // Truncate to 85.05112878 to avoid singularity at poles
+    siny = Math.min(Math.max(siny, -0.9999), 0.9999);
+    return {
+      x: worldSize * (0.5 + lng / 360),
+      y: worldSize * (0.5 - Math.log((1 + siny) / (1 - siny)) / (4 * Math.PI))
+    };
+  };
+
+  const point = project(lat, lng);
+  const anchor = project(anchorLat, anchorLng);
+
+  return { x: point.x - anchor.x, y: point.y - anchor.y };
 };
 
 // --- Hooks ---
@@ -126,15 +138,22 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
+      // Throttle: Max 2 updates per second
       if (now - lastUpdate.current < 500) return;
+      
+      // Sanity check for invalid coordinates
+      if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
+      
       lastUpdate.current = now;
 
       setState(prev => {
+        // Deep comparison to prevent re-renders on identical data
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
             prev.coords.speed === coords.speed &&
-            prev.coords.heading === coords.heading) {
+            prev.coords.heading === coords.heading &&
+            prev.coords.accuracy === coords.accuracy) {
           return prev;
         }
         
@@ -156,15 +175,9 @@ const useGeolocation = () => {
     const handleError = (error: GeolocationPositionError) => {
       let errorMessage = "Signal Lost";
       switch(error.code) {
-        case error.PERMISSION_DENIED:
-          errorMessage = "Location access denied";
-          break;
-        case error.POSITION_UNAVAILABLE:
-          errorMessage = "Position unavailable";
-          break;
-        case error.TIMEOUT:
-          // Don't clear old coords on timeout, just keep loading state false
-          return; 
+        case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
+        case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
+        case error.TIMEOUT: return; // Ignore timeouts, keep last known position
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
@@ -172,11 +185,7 @@ const useGeolocation = () => {
     const watcher = navigator.geolocation.watchPosition(
       handleSuccess, 
       handleError, 
-      { 
-        enableHighAccuracy: true, 
-        timeout: 20000, 
-        maximumAge: 2000 
-      }
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 1000 }
     );
 
     return () => navigator.geolocation.clearWatch(watcher);
@@ -195,19 +204,16 @@ const useCompass = () => {
   const rafIdRef = useRef<number | null>(null);
   const isAnimating = useRef(false);
 
-  // Check if permission is needed on mount
+  // Auto-grant non-iOS
   useEffect(() => {
     if (typeof window !== 'undefined') {
       const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission === 'function';
-      if (!isIOS) {
-        setPermissionGranted(true);
-      }
+      if (!isIOS) setPermissionGranted(true);
     }
   }, []);
 
   const requestAccess = useCallback(async () => {
     const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission === 'function';
-    
     if (isIOS) {
       try {
         const response = await (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission!();
@@ -215,50 +221,45 @@ const useCompass = () => {
           setPermissionGranted(true); 
           setError(null); 
         } else { 
-          setError("Permission denied"); 
+          setError("Denied"); 
         }
-      } catch (e) { 
-        console.error(e);
-        setError("Compass not supported"); 
-      }
+      } catch (e) { setError("Not supported"); }
     } else { 
       setPermissionGranted(true); 
-      setError(null); 
     }
   }, []);
 
-  // Physics Loop
+  // Optimized Physics Loop
   useEffect(() => {
+    if (!permissionGranted) return;
+
     const loop = () => {
-      if (!isAnimating.current) {
-         rafIdRef.current = requestAnimationFrame(loop);
-         return;
-      }
-
+      // If we are close enough, stop the loop to save battery
       const diff = targetRef.current - currentRef.current;
-      
-      if (Math.abs(diff) < 0.05) {
-         currentRef.current = targetRef.current;
-         setVisualHeading((currentRef.current % 360 + 360) % 360);
+      if (Math.abs(diff) < 0.1) {
          isAnimating.current = false;
-         rafIdRef.current = requestAnimationFrame(loop);
+         // Set exact value to stop micro-jitters
+         if (currentRef.current !== targetRef.current) {
+            currentRef.current = targetRef.current;
+            setVisualHeading((currentRef.current % 360 + 360) % 360);
+         }
          return;
       }
 
+      // Spring physics (Damping)
       currentRef.current += diff * 0.15;
       setVisualHeading((currentRef.current % 360 + 360) % 360);
-      
       rafIdRef.current = requestAnimationFrame(loop);
     };
-    
-    if (permissionGranted) {
-      rafIdRef.current = requestAnimationFrame(loop);
+
+    if (isAnimating.current) {
+        rafIdRef.current = requestAnimationFrame(loop);
     }
     
     return () => { 
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); 
     };
-  }, [permissionGranted]);
+  }, [permissionGranted, trueHeading]); // Re-trigger when trueHeading changes to restart loop
 
   // Event Listener
   useEffect(() => {
@@ -270,34 +271,40 @@ const useCompass = () => {
       if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
         degree = e.webkitCompassHeading;
       } else if (e.alpha !== null) {
-        // Fallback for Android (simplified, real logic requires absolute checking)
-         degree = Math.abs(360 - e.alpha);
+        degree = Math.abs(360 - e.alpha);
       }
       
       if (degree !== null) {
         const normalized = ((degree) + 360) % 360;
         setTrueHeading(normalized);
         
-        // Calculate shortest rotation path
         const current = targetRef.current;
-        // Get current visual angle normalized 0-360 for delta calc
         const currentMod = (current % 360 + 360) % 360;
         let delta = normalized - currentMod;
         
+        // Shortest path logic
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
         
-        // Only update target if change is significant to avoid micro-jitters
+        // Threshold to start animation
         if (Math.abs(delta) > 0.5) {
           targetRef.current = current + delta;
-          isAnimating.current = true;
+          if (!isAnimating.current) {
+             isAnimating.current = true;
+             // Restart loop
+             rafIdRef.current = requestAnimationFrame(() => {
+                 const diff = targetRef.current - currentRef.current;
+                 currentRef.current += diff * 0.15;
+                 setVisualHeading((currentRef.current % 360 + 360) % 360);
+                 if (Math.abs(diff) > 0.1) isAnimating.current = true; 
+             });
+          }
         }
       }
     };
     
     const win = window as any;
     const eventName = 'ondeviceorientationabsolute' in win ? 'deviceorientationabsolute' : 'deviceorientation';
-    
     window.addEventListener(eventName, handleOrientation, true);
     return () => window.removeEventListener(eventName, handleOrientation, true);
   }, [permissionGranted]);
@@ -338,6 +345,7 @@ const RadarMapbox = memo(({
   const [imgLoaded, setImgLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
 
+  // Update anchor logic
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
     setIsOffCenter(distance > 10);
@@ -345,13 +353,13 @@ const RadarMapbox = memo(({
     if (distance > MAP_UPDATE_THRESHOLD) {
       setAnchor({ lat, lng });
       setImgLoaded(false);
-      setMapError(false); // Retry loading on move
+      setMapError(false);
     }
   }, [lat, lng, anchor]);
 
   const mapUrl = useMemo(() => 
     `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/500x500@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
-  [anchor]);
+  [anchor.lat, anchor.lng]);
 
   const { userX, userY, svgPath } = useMemo(() => {
     const userPos = geoToPixels(lat, lng, anchor.lat, anchor.lng, RADAR_ZOOM);
@@ -373,7 +381,7 @@ const RadarMapbox = memo(({
 
   return (
     <div className="relative w-64 h-64 md:w-72 md:h-72">
-      <div className="w-full h-full rounded-full border-2 border-border/40 bg-black overflow-hidden shadow-[0_0_30px_rgba(0,0,0,0.6)] group relative">
+      <div className="w-full h-full rounded-full border-2 border-border/40 bg-black overflow-hidden shadow-[0_0_30px_rgba(0,0,0,0.6)] group relative isolate">
         
         {/* Map Container */}
         <div 
@@ -384,7 +392,6 @@ const RadarMapbox = memo(({
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%]">
              <div className="absolute inset-0 bg-[#0c100c]" />
              
-             {/* Fallback Grid */}
              {(!imgLoaded || mapError) && (
                <div className="absolute inset-0 opacity-20" 
                  style={{ 
@@ -397,7 +404,7 @@ const RadarMapbox = memo(({
              {!mapError && (
                <img
                  src={mapUrl}
-                 alt="Map"
+                 alt="Satellite View"
                  onLoad={() => setImgLoaded(true)}
                  onError={() => setMapError(true)}
                  className={`w-full h-full object-contain transition-opacity duration-500 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
@@ -407,7 +414,7 @@ const RadarMapbox = memo(({
           </div>
 
           {/* SVG Overlay */}
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none">
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
             <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
               {svgPath && (
                 <path 
@@ -433,12 +440,12 @@ const RadarMapbox = memo(({
         </div>
 
         {/* Radar Sweep Animation */}
-        <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden">
+        <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden z-20">
              <div className="absolute inset-0 bg-[conic-gradient(from_0deg,transparent_0deg,transparent_270deg,rgba(34,197,94,0.2)_360deg)] animate-[spin_4s_linear_infinite]" />
         </div>
 
         {/* Static Bezel */}
-        <div className="absolute inset-0 pointer-events-none rounded-full border border-green-500/30 z-20">
+        <div className="absolute inset-0 pointer-events-none rounded-full border border-green-500/30 z-30">
           <div className="absolute top-1/2 left-0 w-full h-[1px] bg-green-500/15" />
           <div className="absolute top-0 left-1/2 h-full w-[1px] bg-green-500/15" />
           <div className="absolute inset-0 rounded-full bg-[radial-gradient(circle,transparent_55%,rgba(0,0,0,0.85)_100%)]" />
@@ -451,16 +458,15 @@ const RadarMapbox = memo(({
           </div>
         </div>
         
-        {/* Attribution (Required by Mapbox) */}
         {imgLoaded && !mapError && (
-          <div className="absolute bottom-1 right-3 text-[7px] text-white/40 z-20 pointer-events-none">© Mapbox</div>
+          <div className="absolute bottom-1 right-3 text-[7px] text-white/40 z-30 pointer-events-none">© Mapbox</div>
         )}
 
-        {/* Mode Toggle */}
         <button
            onClick={onToggleMode}
            type="button"
-           className="absolute bottom-4 left-1/2 -translate-x-1/2 text-[9px] font-black tracking-[0.1em] text-green-500/90 bg-black/80 px-2.5 py-1 rounded-sm backdrop-blur-md z-30 border border-green-500/20 pointer-events-auto hover:bg-green-500/20 transition-all active:scale-95 touch-manipulation"
+           aria-label="Toggle Map Orientation"
+           className="absolute bottom-4 left-1/2 -translate-x-1/2 text-[9px] font-black tracking-[0.1em] text-green-500/90 bg-black/80 px-2.5 py-1 rounded-sm backdrop-blur-md z-40 border border-green-500/20 pointer-events-auto hover:bg-green-500/20 transition-all active:scale-95 touch-manipulation"
         >
           {mode === 'heading-up' ? 'H-UP' : 'N-UP'}
         </button>
@@ -470,6 +476,7 @@ const RadarMapbox = memo(({
         <button 
           onClick={onRecenter}
           type="button"
+          aria-label="Recenter Map"
           className="absolute -bottom-8 left-1/2 -translate-x-1/2 p-2 rounded-full bg-background/80 backdrop-blur-sm border border-border/40 text-muted-foreground hover:text-foreground hover:border-foreground/40 transition-all duration-200 active:scale-95 shadow-lg z-30 touch-manipulation"
         >
           <Crosshair className="w-4 h-4" />
@@ -520,7 +527,12 @@ const CompassDisplay = memo(({
 
   return (
     <div className="flex flex-col items-center justify-center mb-6 relative z-10 animate-in zoom-in-50 duration-700 fade-in">
-      <div className="relative w-64 h-64 md:w-72 md:h-72 cursor-pointer group" onClick={onClick}>
+      <div 
+        className="relative w-64 h-64 md:w-72 md:h-72 cursor-pointer group" 
+        onClick={onClick}
+        role="button"
+        aria-label="Compass"
+      >
         <div className="absolute top-0 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
           <div className="w-0 h-0 border-l-[7px] border-l-transparent border-r-[7px] border-r-transparent border-t-[12px] border-t-red-500/90 drop-shadow-lg" />
         </div>
@@ -589,6 +601,8 @@ const CoordinateDisplay = memo(({
     <div 
       className="group cursor-pointer flex flex-col items-center justify-center transition-all duration-200 hover:opacity-70 active:scale-95 px-4 py-2 rounded-lg hover:bg-muted/20 touch-manipulation" 
       onClick={handleCopy}
+      role="button"
+      aria-label={`Copy ${label}`}
     >
       <span className={`text-[9px] uppercase tracking-[0.25em] mb-2 font-bold select-none transition-colors duration-300 ${copied ? "text-green-500" : "text-muted-foreground"}`}>
         {copied ? "COPIED" : label}
@@ -601,7 +615,7 @@ const CoordinateDisplay = memo(({
 });
 CoordinateDisplay.displayName = "CoordinateDisplay";
 
-const StatMinimal = ({ icon: Icon, label, value }: { icon: any, label: string, value: string }) => (
+const StatMinimal = memo(({ icon: Icon, label, value }: { icon: any, label: string, value: string }) => (
   <div className="flex flex-col items-center justify-center min-w-[80px] p-3 rounded-lg hover:bg-muted/30 transition-colors">
     <div className="flex items-center gap-1.5 text-muted-foreground mb-1.5">
       <Icon className="w-3.5 h-3.5 opacity-60" />
@@ -609,7 +623,8 @@ const StatMinimal = ({ icon: Icon, label, value }: { icon: any, label: string, v
     </div>
     <span className="text-lg md:text-xl font-mono font-bold text-foreground/90 tabular-nums whitespace-nowrap">{value}</span>
   </div>
-);
+));
+StatMinimal.displayName = "StatMinimal";
 
 export default function GeoLocation() {
   const { coords, error, loading } = useGeolocation();
@@ -674,6 +689,7 @@ export default function GeoLocation() {
   useEffect(() => {
     if (!debouncedCoords) return;
     
+    // Check if moved enough to fetch new data
     if (lastApiFetch) {
         const distKm = getDistance(lastApiFetch.lat, lastApiFetch.lng, debouncedCoords.latitude, debouncedCoords.longitude) / 1000;
         if (distKm < API_FETCH_DISTANCE_THRESHOLD && address && weather) return;
@@ -755,6 +771,7 @@ export default function GeoLocation() {
         <button 
           onClick={toggleUnits} 
           type="button"
+          aria-label="Toggle Units"
           className="p-2 rounded-full bg-muted/20 hover:bg-muted/40 backdrop-blur-md text-xs font-bold uppercase tracking-wider text-muted-foreground transition-colors border border-border/10 touch-manipulation"
         >
           {units === 'metric' ? 'MET' : 'IMP'}
