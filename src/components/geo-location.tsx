@@ -10,15 +10,23 @@ import {
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
+// --- Mapbox GL JS ---
+// Note: You must install mapbox-gl: `npm install mapbox-gl`
+import mapboxgl from 'mapbox-gl';
+import 'mapbox-gl/dist/mapbox-gl.css';
+
 // --- Configuration ---
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
+// Set the token for the library
+mapboxgl.accessToken = MAPBOX_TOKEN;
+
 const RADAR_ZOOM = 18;
 const TRAIL_MAX_POINTS = 100; // Visual trail only
 const TRAIL_MIN_DISTANCE = 5; 
-const MAP_UPDATE_THRESHOLD = 80; // Distance in meters before reloading map tile
-const API_FETCH_DISTANCE_THRESHOLD = 1.0; // Fetch weather/address every 1km
-const REC_MIN_DISTANCE = 5; // Stricter noise reduction for GPX recording
-const GPS_HEADING_THRESHOLD = 1.0; // Speed (m/s) at which we switch to GPS heading (~3.6 km/h)
+const MAP_UPDATE_THRESHOLD = 80; // Distance in meters before reloading radar tile
+const API_FETCH_DISTANCE_THRESHOLD = 1.0; 
+const REC_MIN_DISTANCE = 5; 
+const GPS_HEADING_THRESHOLD = 1.0; 
 
 // --- Types ---
 type Coordinates = {
@@ -197,7 +205,6 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
-      // Throttle updates slightly to prevent render thrashing (200ms)
       if (now - lastUpdate.current < 200) return;
       if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
       lastUpdate.current = now;
@@ -237,7 +244,6 @@ const useGeolocation = () => {
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
 
-    // Use higher timeout for stability, but high accuracy for mapping
     const watcher = navigator.geolocation.watchPosition(
       handleSuccess, handleError, 
       { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
@@ -369,10 +375,9 @@ const RadarMapbox = memo(({
   const [imgLoaded, setImgLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
 
-  // Map tile loading strategy
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
-    setIsOffCenter(distance > 30); // Show button if 30m away from center tile
+    setIsOffCenter(distance > 30); 
 
     if (distance > MAP_UPDATE_THRESHOLD) {
       setAnchor({ lat, lng });
@@ -400,8 +405,6 @@ const RadarMapbox = memo(({
 
   const rotation = mode === 'heading-up' ? heading : 0;
   const markerRotation = mode === 'heading-up' ? 0 : heading;
-
-  // Accuracy Ring Color
   const accColor = !accuracy ? 'border-muted/20' 
     : accuracy < 10 ? 'border-green-500/50' 
     : accuracy < 30 ? 'border-yellow-500/50' 
@@ -456,17 +459,13 @@ const RadarMapbox = memo(({
           </div>
         </div>
 
-        {/* Visual Overlays */}
         <div className={`absolute inset-0 rounded-full border-4 ${accColor} pointer-events-none z-10 transition-colors duration-500`} />
         <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20 rounded-full" />
         <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
-        
-        {/* Radar Sweep Animation */}
         <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden z-20">
              <div className="absolute inset-0 bg-[conic-gradient(from_0deg,transparent_0deg,transparent_280deg,rgba(34,197,94,0.15)_360deg)] animate-[spin_4s_linear_infinite]" />
         </div>
 
-        {/* Crosshair & Indicators */}
         <div className="absolute inset-0 pointer-events-none z-30">
            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 opacity-50">
               <div className="absolute top-1/2 left-0 w-2 h-px bg-green-500" />
@@ -629,7 +628,6 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
   let progress = 0;
 
   if (now < riseToday) {
-    // Before dawn today
     isDay = false;
     nextEventLabel = "Sunrise";
     nextEventTime = riseToday;
@@ -637,14 +635,12 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
     const nightLength = riseToday - prevSunset;
     progress = 100 - ((riseToday - now) / nightLength) * 100;
   } else if (now >= riseToday && now < setToday) {
-    // Daytime
     isDay = true;
     nextEventLabel = "Sunset";
     nextEventTime = setToday;
     const dayLength = setToday - riseToday;
     progress = ((now - riseToday) / dayLength) * 100;
   } else {
-    // After sunset today
     isDay = false;
     nextEventLabel = "Sunrise";
     nextEventTime = riseTomorrow;
@@ -725,6 +721,7 @@ const CoordinateRow = memo(({
 });
 CoordinateRow.displayName = "CoordinateRow";
 
+// --- FULL MAP DRAWER (Now using Mapbox GL JS) ---
 const FullMapDrawer = memo(({ 
   isOpen, 
   onClose, 
@@ -736,32 +733,80 @@ const FullMapDrawer = memo(({
   lat: number, 
   lng: number 
 }) => {
-  const [imgLoaded, setImgLoaded] = useState(false);
-  const [imgError, setImgError] = useState(false);
   const [copied, setCopied] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-  
-  // View State
-  const [viewState, setViewState] = useState({ x: 0, y: 0, scale: 1 });
-  const [isDragging, setIsDragging] = useState(false);
-  
-  // Pointer refs
-  const pointerCache = useRef<Map<number, { x: number, y: number }>>(new Map());
-  const initialDist = useRef<number | null>(null);
-  const initialScale = useRef<number>(1);
-  const startPos = useRef({ x: 0, y: 0 });
+  const mapContainer = useRef<HTMLDivElement>(null);
+  const map = useRef<mapboxgl.Map | null>(null);
+  const marker = useRef<mapboxgl.Marker | null>(null);
+  const [zoomLevel, setZoomLevel] = useState(16);
 
+  // Initialize Map
   useEffect(() => {
-    if (isOpen) {
-      setViewState({ x: 0, y: 0, scale: 1 });
-      setImgLoaded(false);
-      setImgError(false);
-    }
-  }, [isOpen, lat, lng]);
+    if (!isOpen || !mapContainer.current) return;
+    if (map.current) return; // Initialize only once
 
-  const mapUrl = useMemo(() => 
-    `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/pin-l+ef4444(${lng},${lat})/${lng},${lat},${RADAR_ZOOM - 1},0,0/800x1000@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
-  [lat, lng]);
+    map.current = new mapboxgl.Map({
+      container: mapContainer.current,
+      style: 'mapbox://styles/mapbox/satellite-streets-v12',
+      center: [lng, lat],
+      zoom: 16,
+      attributionControl: false // Minimal UI
+    });
+
+    // Add Attribution manually if needed, or stick to small button
+    map.current.addControl(new mapboxgl.AttributionControl({ compact: true }), 'bottom-right');
+
+    // Custom CSS Marker
+    const el = document.createElement('div');
+    el.className = 'marker';
+    el.innerHTML = `
+      <div style="position: relative; width: 20px; height: 20px; display: flex; justify-content: center; align-items: center;">
+        <div style="position: absolute; width: 100%; height: 100%; border-radius: 50%; background-color: rgba(34, 197, 94, 0.5); animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>
+        <div style="width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 10px rgba(34,197,94,0.8);"></div>
+      </div>
+      <style>
+        @keyframes ping {
+          75%, 100% { transform: scale(2); opacity: 0; }
+        }
+      </style>
+    `;
+
+    marker.current = new mapboxgl.Marker({ element: el })
+      .setLngLat([lng, lat])
+      .addTo(map.current);
+
+    map.current.on('zoom', () => {
+      if(map.current) setZoomLevel(map.current.getZoom());
+    });
+
+  }, [isOpen]);
+
+  // Handle Updates
+  useEffect(() => {
+    if (!map.current) return;
+    
+    // Update marker position
+    if (marker.current) marker.current.setLngLat([lng, lat]);
+
+    // Only FlyTo if we moved significantly or it's first load logic
+    // We don't want to wrestle control from user panning
+    const currentCenter = map.current.getCenter();
+    const dist = getDistance(currentCenter.lat, currentCenter.lng, lat, lng);
+    
+    // If distance > 100m, auto-center. Otherwise let user pan.
+    if (dist > 100) {
+       map.current.flyTo({ center: [lng, lat], speed: 0.8 });
+    }
+  }, [lat, lng]);
+
+  // Handle Resize when Drawer opens
+  useEffect(() => {
+    if (isOpen && map.current) {
+      setTimeout(() => {
+        map.current?.resize();
+        map.current?.flyTo({ center: [lng, lat] });
+      }, 300); // Wait for CSS transition
+    }
+  }, [isOpen]);
 
   const handleCopy = () => {
     if(navigator.clipboard) {
@@ -772,63 +817,11 @@ const FullMapDrawer = memo(({
     }
   };
 
-  const handlePointerDown = (e: React.PointerEvent) => {
-    e.preventDefault();
-    containerRef.current?.setPointerCapture(e.pointerId);
-    pointerCache.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (pointerCache.current.size === 1) {
-       setIsDragging(true);
-       startPos.current = { x: e.clientX - viewState.x, y: e.clientY - viewState.y };
-    } else if (pointerCache.current.size === 2) {
-       setIsDragging(true);
-       const points = Array.from(pointerCache.current.values());
-       initialDist.current = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
-       initialScale.current = viewState.scale;
-    }
-  };
-
-  const handlePointerMove = (e: React.PointerEvent) => {
-    if (!pointerCache.current.has(e.pointerId)) return;
-    e.preventDefault();
-    pointerCache.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-
-    if (pointerCache.current.size === 1) {
-      const newX = e.clientX - startPos.current.x;
-      const newY = e.clientY - startPos.current.y;
-      setViewState(prev => ({ ...prev, x: newX, y: newY }));
-    } else if (pointerCache.current.size === 2 && initialDist.current) {
-      const points = Array.from(pointerCache.current.values());
-      const currentDist = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
-      const ratio = currentDist / initialDist.current;
-      setViewState(prev => ({ ...prev, scale: Math.min(Math.max(initialScale.current * ratio, 0.5), 5) }));
-    }
-  };
-
-  const handlePointerUp = (e: React.PointerEvent) => {
-    containerRef.current?.releasePointerCapture(e.pointerId);
-    pointerCache.current.delete(e.pointerId);
-    if (pointerCache.current.size === 0) {
-      setIsDragging(false);
-      initialDist.current = null;
-    } else if (pointerCache.current.size === 1) {
-       const point = Array.from(pointerCache.current.values())[0];
-       startPos.current = { x: point.x - viewState.x, y: point.y - viewState.y };
-    }
-  };
-
-  const zoomIn = () => {
-     triggerHaptic();
-     setViewState(prev => ({ ...prev, scale: Math.min(prev.scale * 1.5, 5) }));
-  };
-
-  const zoomOut = () => {
-     triggerHaptic();
-     setViewState(prev => ({ ...prev, scale: Math.max(prev.scale / 1.5, 0.5) }));
-  };
-
-  const resetView = () => {
-     triggerHaptic();
-     setViewState({ x: 0, y: 0, scale: 1 });
+  const zoomIn = () => { triggerHaptic(); map.current?.zoomIn(); };
+  const zoomOut = () => { triggerHaptic(); map.current?.zoomOut(); };
+  const resetView = () => { 
+    triggerHaptic(); 
+    map.current?.flyTo({ center: [lng, lat], zoom: 16, bearing: 0, pitch: 0 }); 
   };
 
   return (
@@ -860,69 +853,27 @@ const FullMapDrawer = memo(({
             </button>
         </div>
 
-        {/* --- Main Map Area --- */}
+        {/* --- Map Container --- */}
         <div 
-           className="relative flex-1 w-full h-full overflow-hidden bg-[#111] touch-none cursor-grab active:cursor-grabbing"
-           ref={containerRef}
-           onPointerDown={handlePointerDown}
-           onPointerMove={handlePointerMove}
-           onPointerUp={handlePointerUp}
-           onPointerLeave={handlePointerUp}
-           onWheel={(e) => {
-             const factor = e.deltaY > 0 ? 0.9 : 1.1;
-             setViewState(prev => ({ ...prev, scale: Math.min(Math.max(prev.scale * factor, 0.5), 5) }));
-           }}
+           className="relative flex-1 w-full h-full overflow-hidden bg-[#111]"
+           ref={mapContainer}
         >
-             {/* Grid Overlay (Static) */}
-             <div className="absolute inset-0 pointer-events-none z-10 opacity-[0.07]" 
-                  style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }} 
-             />
-             
-             {/* Center Crosshair (Static) */}
-             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none opacity-50">
-                  <div className="w-12 h-12 border border-white/30 rounded-full flex items-center justify-center">
-                      <div className="w-1 h-1 bg-green-500 rounded-full shadow-[0_0_8px_#22c55e]" />
-                  </div>
-                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[140%] h-[1px] bg-gradient-to-r from-transparent via-white/20 to-transparent" />
-                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-[140%] w-[1px] bg-gradient-to-b from-transparent via-white/20 to-transparent" />
-             </div>
+           {/* Fallback Loader if map renders slowly */}
+           <div className="absolute inset-0 flex items-center justify-center -z-10">
+               <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
+           </div>
 
-             {/* The Map Image */}
-             <div className="w-full h-full flex items-center justify-center transition-transform duration-75 will-change-transform"
-                  style={{ transform: `translate(${viewState.x}px, ${viewState.y}px) scale(${viewState.scale})` }}
-             >
-                {isOpen && !imgError && (
-                    <img
-                        src={mapUrl}
-                        alt="Satellite"
-                        draggable={false}
-                        onLoad={() => setImgLoaded(true)}
-                        onError={() => setImgError(true)}
-                        className={`max-w-none w-[800px] h-[1000px] object-cover transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
-                        style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.9)' }}
-                    />
-                )}
-                {/* Fallback/Loading */}
-                {(!imgLoaded || imgError) && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center z-0">
-                        {imgError ? (
-                            <div className="text-center space-y-2">
-                                <WifiOff className="w-8 h-8 text-white/20 mx-auto" />
-                                <p className="text-[10px] font-mono text-white/40 uppercase tracking-widest">Map Data Unavailable</p>
-                            </div>
-                        ) : (
-                            <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
-                        )}
-                    </div>
-                )}
-             </div>
+           {/* Static HUD Overlay (Reticle) */}
+           <div className="absolute inset-0 pointer-events-none z-10 opacity-[0.05]" 
+                style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }} 
+           />
         </div>
 
         {/* --- Side Controls --- */}
         <div className="absolute right-4 top-1/2 -translate-y-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
              <div className="pointer-events-auto flex flex-col gap-2 bg-black/40 backdrop-blur-md p-1.5 rounded-2xl border border-white/10">
                  <button onClick={zoomIn} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Plus className="w-5 h-5"/></button>
-                 <button onClick={resetView} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors text-[10px] font-bold font-mono">{Math.round(viewState.scale * 100)}%</button>
+                 <button onClick={resetView} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors text-[10px] font-bold font-mono">{Math.round(zoomLevel)}z</button>
                  <button onClick={zoomOut} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Minus className="w-5 h-5"/></button>
              </div>
         </div>
@@ -971,8 +922,6 @@ export default function GeoLocation() {
     return () => { isMountedRef.current = false; };
   }, []);
 
-  // HYBRID COMPASS LOGIC
-  // If moving faster than threshold, use GPS heading. Otherwise use Mag compass.
   const isMoving = (coords?.speed ?? 0) > GPS_HEADING_THRESHOLD;
   const effectiveHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined
     ? coords.heading
@@ -982,7 +931,6 @@ export default function GeoLocation() {
     ? coords.heading
     : trueHeading;
 
-  // Recording Logic
   useEffect(() => {
     if (!coords) return;
     const newPoint = { lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() };
@@ -1054,7 +1002,6 @@ export default function GeoLocation() {
   const toggleMapMode = useCallback(() => setMapMode(prev => prev === 'heading-up' ? 'north-up' : 'heading-up'), []);
   const debouncedCoords = useDebounce(coords, 2000);
 
-  // API Fetch
   useEffect(() => {
     if (!debouncedCoords) return;
     if (lastApiFetch) {
