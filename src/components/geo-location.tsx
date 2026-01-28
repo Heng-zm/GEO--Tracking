@@ -5,20 +5,20 @@ import {
   Sun, Cloud, CloudRain, CloudLightning, Snowflake, CloudFog, CloudSun,
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
-  Maximize2, X, ExternalLink, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
-  Plus, Minus, Play, Square
+  Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
+  Share2, Signal, Plus, Minus, Copy, Check
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 // --- Configuration ---
-// Note: In a production app, proxy this token through a backend to prevent exposure.
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 const RADAR_ZOOM = 18;
 const TRAIL_MAX_POINTS = 100; // Visual trail only
 const TRAIL_MIN_DISTANCE = 5; 
-const MAP_UPDATE_THRESHOLD = 100; // Increased to 100m to prevent constant tile reloading
+const MAP_UPDATE_THRESHOLD = 80; // Distance in meters before reloading map tile
 const API_FETCH_DISTANCE_THRESHOLD = 1.0; // Fetch weather/address every 1km
-const REC_MIN_DISTANCE = 3; // Minimum meters to move to record a GPX point (noise reduction)
+const REC_MIN_DISTANCE = 5; // Stricter noise reduction for GPX recording
+const GPS_HEADING_THRESHOLD = 1.0; // Speed (m/s) at which we switch to GPS heading (~3.6 km/h)
 
 // --- Types ---
 type Coordinates = {
@@ -42,8 +42,8 @@ type WeatherData = {
   description: string;
   windSpeed: number;
   windDir: number;
-  sunrise: string[]; // Array of ISO strings (Today, Tomorrow)
-  sunset: string[];  // Array of ISO strings (Today, Tomorrow)
+  sunrise: string[];
+  sunset: string[];
 };
 
 type GeoPoint = { lat: number; lng: number; alt: number | null; timestamp: number };
@@ -59,11 +59,9 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 
 // --- Helpers ---
 const triggerHaptic = () => {
-  try {
-    if (typeof navigator !== 'undefined' && navigator.vibrate) {
-      navigator.vibrate(15);
-    }
-  } catch (e) {}
+  if (typeof navigator !== 'undefined' && navigator.vibrate) {
+    navigator.vibrate(10);
+  }
 };
 
 const formatCoordinate = (value: number, type: 'lat' | 'lng'): string => {
@@ -128,7 +126,6 @@ const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => 
 const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: number, zoom: number) => {
   const TILE_SIZE = 512; 
   const worldSize = TILE_SIZE * Math.pow(2, zoom);
-
   const project = (lat: number, lng: number) => {
     let siny = Math.sin((lat * Math.PI) / 180);
     siny = Math.min(Math.max(siny, -0.9999), 0.9999);
@@ -137,32 +134,26 @@ const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: num
       y: worldSize * (0.5 - Math.log((1 + siny) / (1 - siny)) / (4 * Math.PI))
     };
   };
-
   const point = project(lat, lng);
   const anchor = project(anchorLat, anchorLng);
-
   return { x: point.x - anchor.x, y: point.y - anchor.y };
 };
 
-// GPX Generator
 const generateGPX = (points: GeoPoint[]) => {
   const header = `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="FieldNavApp" xmlns="http://www.topografix.com/GPX/1/1">
   <trk>
     <name>Mission Log ${new Date().toISOString()}</name>
     <trkseg>`;
-  
   const footer = `
     </trkseg>
   </trk>
 </gpx>`;
-
   const body = points.map(p => `
       <trkpt lat="${p.lat}" lon="${p.lng}">
         ${p.alt !== null ? `<ele>${p.alt.toFixed(2)}</ele>` : ''}
         <time>${new Date(p.timestamp).toISOString()}</time>
       </trkpt>`).join('');
-
   return header + body + footer;
 };
 
@@ -170,19 +161,14 @@ const generateGPX = (points: GeoPoint[]) => {
 const useWakeLock = () => {
   useEffect(() => {
     let wakeLock: any = null;
-    
     const requestLock = async () => {
       try {
         if ('wakeLock' in navigator && document.visibilityState === 'visible') {
           wakeLock = await (navigator as any).wakeLock.request('screen');
         }
-      } catch (err) {
-        // Wake lock denied or not supported
-      }
+      } catch (err) {}
     };
-
     requestLock();
-
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         requestLock();
@@ -191,9 +177,7 @@ const useWakeLock = () => {
         wakeLock = null;
       }
     };
-
     document.addEventListener('visibilitychange', handleVisibilityChange);
-
     return () => {
       if (wakeLock) wakeLock.release().catch(() => {});
       document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -213,13 +197,12 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
-      // Throttle updates slightly to prevent render thrashing
-      if (now - lastUpdate.current < 500) return;
+      // Throttle updates slightly to prevent render thrashing (200ms)
+      if (now - lastUpdate.current < 200) return;
       if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
       lastUpdate.current = now;
 
       setState(prev => {
-        // Deep comparison to avoid unnecessary state updates
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
@@ -249,13 +232,15 @@ const useGeolocation = () => {
       switch(error.code) {
         case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
         case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return; // Don't wipe state on timeout, wait for next
+        case error.TIMEOUT: return; 
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
 
+    // Use higher timeout for stability, but high accuracy for mapping
     const watcher = navigator.geolocation.watchPosition(
-      handleSuccess, handleError, { enableHighAccuracy: true, timeout: 20000, maximumAge: 1000 }
+      handleSuccess, handleError, 
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
     );
 
     return () => navigator.geolocation.clearWatch(watcher);
@@ -273,18 +258,14 @@ const useCompass = () => {
   const currentRef = useRef<number>(0);
   const rafIdRef = useRef<number | null>(null);
   
-  // Animation Loop for Smooth Compass
   useEffect(() => {
     if (!permissionGranted) return;
     
     let isRunning = true;
-    
     const loop = () => {
       if (!isRunning) return;
-
       const diff = targetRef.current - currentRef.current;
       
-      // Stop animation if close enough to save battery
       if (Math.abs(diff) < 0.05) {
          if (currentRef.current !== targetRef.current) {
             currentRef.current = targetRef.current;
@@ -294,14 +275,11 @@ const useCompass = () => {
          return;
       }
       
-      // Interpolate with ease
       currentRef.current += diff * 0.15;
       setVisualHeading((currentRef.current % 360 + 360) % 360);
       rafIdRef.current = requestAnimationFrame(loop);
     };
-
     rafIdRef.current = requestAnimationFrame(loop);
-    
     return () => { 
       isRunning = false;
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); 
@@ -330,38 +308,26 @@ const useCompass = () => {
 
     const handleOrientation = (e: any) => {
       let degree: number | null = null;
-      
-      // iOS
       if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
         degree = e.webkitCompassHeading;
-      } 
-      // Android / Standards
-      else if (e.alpha !== null) {
-        // Android absolute orientation often needs the offset
-        // This is a simplified fallback; actual absolute orientation on Android can be complex
+      } else if (e.alpha !== null) {
         degree = Math.abs(360 - e.alpha);
       }
 
       if (degree !== null) {
         const normalized = ((degree) + 360) % 360;
         setTrueHeading(normalized);
-        
-        // Shortest path interpolation logic for the animator
         const current = targetRef.current;
         const currentMod = (current % 360 + 360) % 360;
         let delta = normalized - currentMod;
-        
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
-        
         targetRef.current = current + delta;
       }
     };
 
-    // Prefer deviceorientationabsolute if available (Android)
     const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
     window.addEventListener(eventName, handleOrientation, true);
-    
     return () => window.removeEventListener(eventName, handleOrientation, true);
   }, [permissionGranted]);
 
@@ -385,6 +351,7 @@ const RadarMapbox = memo(({
   lat, 
   lng,
   mode,
+  accuracy,
   onRecenter,
   onToggleMode
 }: { 
@@ -393,6 +360,7 @@ const RadarMapbox = memo(({
   lat: number, 
   lng: number,
   mode: MapMode,
+  accuracy: number | null,
   onRecenter: () => void,
   onToggleMode: () => void
 }) => {
@@ -400,32 +368,21 @@ const RadarMapbox = memo(({
   const [isOffCenter, setIsOffCenter] = useState(false);
   const [imgLoaded, setImgLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
-  const [displayMapUrl, setDisplayMapUrl] = useState("");
 
   // Map tile loading strategy
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
-    setIsOffCenter(distance > 25); // Show button if 25m away from center tile
+    setIsOffCenter(distance > 30); // Show button if 30m away from center tile
 
-    // Only update the anchor (and trigger a new image load) if we moved significantly
     if (distance > MAP_UPDATE_THRESHOLD) {
-      const newUrl = `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${lng},${lat},${RADAR_ZOOM},0,0/500x500@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`;
       setAnchor({ lat, lng });
       setImgLoaded(false); 
       setMapError(false);
     }
   }, [lat, lng, anchor]);
 
-  // Initial load
-  useEffect(() => {
-    if (!displayMapUrl) {
-      setDisplayMapUrl(`https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${lng},${lat},${RADAR_ZOOM},0,0/500x500@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`);
-    }
-  }, []);
-
-  // Update URL based on anchor change
   const currentMapUrl = useMemo(() => 
-    `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/500x500@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
+    `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/600x600@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
   [anchor.lat, anchor.lng]);
 
   const { userX, userY, svgPath } = useMemo(() => {
@@ -444,18 +401,20 @@ const RadarMapbox = memo(({
   const rotation = mode === 'heading-up' ? heading : 0;
   const markerRotation = mode === 'heading-up' ? 0 : heading;
 
+  // Accuracy Ring Color
+  const accColor = !accuracy ? 'border-muted/20' 
+    : accuracy < 10 ? 'border-green-500/50' 
+    : accuracy < 30 ? 'border-yellow-500/50' 
+    : 'border-red-500/50';
+
   return (
-    <div className="relative w-60 h-60 md:w-80 md:h-80 shrink-0 transition-all duration-300">
+    <div className="relative w-64 h-64 md:w-80 md:h-80 shrink-0 transition-all duration-300">
       <div className="absolute inset-0 rounded-full border border-border/20 bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
       <div className="w-full h-full relative isolate">
         
         <div 
           className="absolute inset-0 rounded-full overflow-hidden bg-black z-0"
-          style={{ 
-             WebkitMaskImage: '-webkit-radial-gradient(white, black)',
-             maskImage: 'radial-gradient(white, black)',
-             transform: 'translateZ(0)'
-          }}
+          style={{ maskImage: 'radial-gradient(white, black)', transform: 'translateZ(0)' }}
         >
           <div 
             className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear origin-center"
@@ -475,7 +434,7 @@ const RadarMapbox = memo(({
                    alt="Satellite View"
                    onLoad={() => setImgLoaded(true)}
                    onError={() => setMapError(true)}
-                   className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-40'}`}
+                   className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
                    style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.8)' }}
                  />
                )}
@@ -487,7 +446,7 @@ const RadarMapbox = memo(({
                 )}
                 <g transform={`translate(${userX}, ${userY})`}>
                    <g transform={`rotate(${markerRotation})`}>
-                      <path d="M -6 -6 L 0 -18 L 6 -6" fill="rgba(34,197,94,0.8)" />
+                      <path d="M -6 -6 L 0 -18 L 6 -6" fill="rgba(34,197,94,0.9)" />
                       <circle r="5" fill="#22c55e" className="animate-pulse" />
                       <circle r="8" fill="none" stroke="#ffffff" strokeWidth="2" className="opacity-90" />
                    </g>
@@ -497,13 +456,17 @@ const RadarMapbox = memo(({
           </div>
         </div>
 
-        <div className="absolute inset-0 rounded-full border-4 border-muted/20 pointer-events-none z-10" />
+        {/* Visual Overlays */}
+        <div className={`absolute inset-0 rounded-full border-4 ${accColor} pointer-events-none z-10 transition-colors duration-500`} />
         <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20 rounded-full" />
         <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
+        
+        {/* Radar Sweep Animation */}
         <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden z-20">
              <div className="absolute inset-0 bg-[conic-gradient(from_0deg,transparent_0deg,transparent_280deg,rgba(34,197,94,0.15)_360deg)] animate-[spin_4s_linear_infinite]" />
         </div>
 
+        {/* Crosshair & Indicators */}
         <div className="absolute inset-0 pointer-events-none z-30">
            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 opacity-50">
               <div className="absolute top-1/2 left-0 w-2 h-px bg-green-500" />
@@ -559,7 +522,6 @@ const CompassTicks = memo(() => (
     <text x="50" y="22" textAnchor="middle" className="text-[5px] font-bold fill-foreground" transform="rotate(90 50 50)">E</text>
     <text x="50" y="22" textAnchor="middle" className="text-[5px] font-bold fill-foreground" transform="rotate(180 50 50)">S</text>
     <text x="50" y="22" textAnchor="middle" className="text-[5px] font-bold fill-foreground" transform="rotate(270 50 50)">W</text>
-    <path d="M 48 50 L 52 50 M 50 48 L 50 52" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/50" />
   </>
 ));
 CompassTicks.displayName = "CompassTicks";
@@ -569,13 +531,15 @@ const CompassDisplay = memo(({
   trueHeading, 
   onClick, 
   hasError, 
-  permissionGranted 
+  permissionGranted,
+  source
 }: { 
   heading: number | null, 
   trueHeading: number | null, 
   onClick: () => void, 
   hasError: boolean, 
-  permissionGranted: boolean 
+  permissionGranted: boolean,
+  source: 'GPS' | 'MAG'
 }) => {
   const rotation = heading || 0;
   const directionStr = trueHeading !== null ? getCompassDirection(trueHeading) : "--";
@@ -604,14 +568,20 @@ const CompassDisplay = memo(({
 
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center z-20 pointer-events-none mix-blend-difference">
              <span className="text-4xl font-mono font-black tracking-tighter text-foreground tabular-nums">
-                {permissionGranted ? `${displayHeading}°` : "--"}
+                {permissionGranted || source === 'GPS' ? `${displayHeading}°` : "--"}
              </span>
              <span className="text-[10px] font-bold text-muted-foreground tracking-[0.3em] uppercase">
-                {permissionGranted ? directionStr : "---"}
+                {permissionGranted || source === 'GPS' ? directionStr : "---"}
+             </span>
+        </div>
+
+        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20">
+             <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border ${source === 'GPS' ? 'text-green-500 border-green-500/20 bg-green-500/10' : 'text-blue-500 border-blue-500/20 bg-blue-500/10'}`}>
+               {source}
              </span>
         </div>
         
-        {!permissionGranted && !hasError && (
+        {!permissionGranted && !hasError && source === 'MAG' && (
           <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-background/60 backdrop-blur-sm">
             <button type="button" className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-primary animate-pulse bg-background px-4 py-2 rounded-full border border-primary/20 shadow-xl">
               <CompassIcon className="w-3 h-3" /> Align
@@ -647,10 +617,8 @@ const StatCard = memo(({ icon: Icon, label, value, subValue, unit }: { icon: any
 ));
 StatCard.displayName = "StatCard";
 
-// Solar Intel Card with enhanced logic for next-day sunrise
 const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string[] }) => {
   const now = new Date().getTime();
-  
   const riseToday = new Date(sunrise[0]).getTime();
   const setToday = new Date(sunset[0]).getTime();
   const riseTomorrow = new Date(sunrise[1]).getTime();
@@ -665,7 +633,7 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
     isDay = false;
     nextEventLabel = "Sunrise";
     nextEventTime = riseToday;
-    const prevSunset = setToday - (24 * 3600 * 1000); // Approximate yesterday's sunset
+    const prevSunset = setToday - (24 * 3600 * 1000); 
     const nightLength = riseToday - prevSunset;
     progress = 100 - ((riseToday - now) / nightLength) * 100;
   } else if (now >= riseToday && now < setToday) {
@@ -684,7 +652,6 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
     progress = ((now - setToday) / nightLength) * 100;
   }
 
-  // Clamping
   progress = Math.min(Math.max(progress, 0), 100);
 
   return (
@@ -692,14 +659,12 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
       <div className="flex items-center justify-between opacity-80">
          <div className="flex items-center gap-2">
             {isDay ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-blue-300" />}
-            <span className="text-[10px] uppercase font-bold tracking-widest">{isDay ? "Daylight Ops" : "Night Ops"}</span>
+            <span className="text-[10px] uppercase font-bold tracking-widest">{isDay ? "Daylight" : "Night Ops"}</span>
          </div>
          <span className="text-[10px] font-mono opacity-60">
            {formatTime(new Date(nextEventTime).toISOString())} {nextEventLabel === "Sunset" ? "SET" : "RISE"}
          </span>
       </div>
-      
-      {/* Visual Day Progress */}
       <div className="relative w-full h-2 bg-black/40 rounded-full overflow-hidden">
          <div className={`absolute inset-0 opacity-20 ${isDay ? 'bg-gradient-to-r from-amber-900 via-amber-500 to-amber-900' : 'bg-gradient-to-r from-blue-900 via-blue-500 to-blue-900'}`} />
          <div 
@@ -707,7 +672,6 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
             style={{ width: `${progress}%`, transition: 'width 1s linear' }}
          />
       </div>
-
       <div className="flex justify-between text-[9px] font-mono text-muted-foreground uppercase">
          <div className="flex items-center gap-1"><Sunrise className="w-3 h-3" /> {formatTime(sunrise[0])}</div>
          <div className="flex items-center gap-1">{formatTime(sunset[0])} <Sunset className="w-3 h-3" /></div>
@@ -761,7 +725,6 @@ const CoordinateRow = memo(({
 });
 CoordinateRow.displayName = "CoordinateRow";
 
-// --- FULL MAP DRAWER COMPONENT ---
 const FullMapDrawer = memo(({ 
   isOpen, 
   onClose, 
@@ -773,112 +736,207 @@ const FullMapDrawer = memo(({
   lat: number, 
   lng: number 
 }) => {
-  
-  const [viewZoom, setViewZoom] = useState(15);
   const [imgLoaded, setImgLoaded] = useState(false);
+  const [imgError, setImgError] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  
+  // View State
+  const [viewState, setViewState] = useState({ x: 0, y: 0, scale: 1 });
+  const [isDragging, setIsDragging] = useState(false);
+  
+  // Pointer refs
+  const pointerCache = useRef<Map<number, { x: number, y: number }>>(new Map());
+  const initialDist = useRef<number | null>(null);
+  const initialScale = useRef<number>(1);
+  const startPos = useRef({ x: 0, y: 0 });
 
-  // Generate Mapbox Static URL with Pin Overlay
+  useEffect(() => {
+    if (isOpen) {
+      setViewState({ x: 0, y: 0, scale: 1 });
+      setImgLoaded(false);
+      setImgError(false);
+    }
+  }, [isOpen, lat, lng]);
+
   const mapUrl = useMemo(() => 
-    `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/pin-l+ef4444(${lng},${lat})/${lng},${lat},${viewZoom},0,0/600x800@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
-  [lat, lng, viewZoom]);
+    `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/pin-l+ef4444(${lng},${lat})/${lng},${lat},${RADAR_ZOOM - 1},0,0/800x1000@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
+  [lat, lng]);
 
-  const openAppleMaps = () => {
-    window.open(`http://maps.apple.com/?q=${lat},${lng}`, '_blank');
+  const handleCopy = () => {
+    if(navigator.clipboard) {
+       navigator.clipboard.writeText(`${lat}, ${lng}`);
+       setCopied(true);
+       setTimeout(() => setCopied(false), 2000);
+       triggerHaptic();
+    }
   };
 
-  const openGoogleMaps = () => {
-    window.open(`https://www.google.com/maps/search/?api=1&query=${lat},${lng}`, '_blank');
+  const handlePointerDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    containerRef.current?.setPointerCapture(e.pointerId);
+    pointerCache.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointerCache.current.size === 1) {
+       setIsDragging(true);
+       startPos.current = { x: e.clientX - viewState.x, y: e.clientY - viewState.y };
+    } else if (pointerCache.current.size === 2) {
+       setIsDragging(true);
+       const points = Array.from(pointerCache.current.values());
+       initialDist.current = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+       initialScale.current = viewState.scale;
+    }
   };
 
-  const handleZoomIn = () => {
-    triggerHaptic();
-    setViewZoom(prev => Math.min(prev + 1, 20));
-    setImgLoaded(false);
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!pointerCache.current.has(e.pointerId)) return;
+    e.preventDefault();
+    pointerCache.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointerCache.current.size === 1) {
+      const newX = e.clientX - startPos.current.x;
+      const newY = e.clientY - startPos.current.y;
+      setViewState(prev => ({ ...prev, x: newX, y: newY }));
+    } else if (pointerCache.current.size === 2 && initialDist.current) {
+      const points = Array.from(pointerCache.current.values());
+      const currentDist = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+      const ratio = currentDist / initialDist.current;
+      setViewState(prev => ({ ...prev, scale: Math.min(Math.max(initialScale.current * ratio, 0.5), 5) }));
+    }
   };
 
-  const handleZoomOut = () => {
-    triggerHaptic();
-    setViewZoom(prev => Math.max(prev - 1, 2));
-    setImgLoaded(false);
+  const handlePointerUp = (e: React.PointerEvent) => {
+    containerRef.current?.releasePointerCapture(e.pointerId);
+    pointerCache.current.delete(e.pointerId);
+    if (pointerCache.current.size === 0) {
+      setIsDragging(false);
+      initialDist.current = null;
+    } else if (pointerCache.current.size === 1) {
+       const point = Array.from(pointerCache.current.values())[0];
+       startPos.current = { x: point.x - viewState.x, y: point.y - viewState.y };
+    }
+  };
+
+  const zoomIn = () => {
+     triggerHaptic();
+     setViewState(prev => ({ ...prev, scale: Math.min(prev.scale * 1.5, 5) }));
+  };
+
+  const zoomOut = () => {
+     triggerHaptic();
+     setViewState(prev => ({ ...prev, scale: Math.max(prev.scale / 1.5, 0.5) }));
+  };
+
+  const resetView = () => {
+     triggerHaptic();
+     setViewState({ x: 0, y: 0, scale: 1 });
   };
 
   return (
     <>
-      <div 
-        className={`fixed inset-0 bg-black/80 backdrop-blur-sm z-[60] transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} 
-        onClick={onClose}
-      />
+      <div className={`fixed inset-0 bg-black/90 backdrop-blur-sm z-[60] transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} onClick={onClose} />
       
-      <div className={`fixed bottom-0 left-0 right-0 h-[90vh] bg-background/95 backdrop-blur-xl border-t border-border/20 rounded-t-3xl shadow-2xl z-[61] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
+      <div className={`fixed bottom-0 left-0 right-0 h-[92dvh] bg-[#0c0c0c] border-t border-white/10 rounded-t-[2rem] shadow-2xl z-[61] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) flex flex-col ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
         
-        {/* --- Top Gradient Overlay for Text Readability --- */}
-        <div className="absolute top-0 left-0 right-0 h-32 bg-gradient-to-b from-black/90 via-black/40 to-transparent z-[62] pointer-events-none rounded-t-3xl" />
-
-        {/* --- Bottom Gradient Overlay for Buttons --- */}
-        <div className="absolute bottom-0 left-0 right-0 h-40 bg-gradient-to-t from-black/90 via-black/60 to-transparent z-[62] pointer-events-none" />
-
-        {/* Handle */}
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 w-12 h-1.5 bg-white/20 rounded-full z-[63] pointer-events-none" />
-
-        {/* Map Header Info */}
-        <div className="absolute top-8 left-6 z-[63] pointer-events-none text-shadow-sm">
-            <h3 className="text-xl font-bold text-white tracking-tight drop-shadow-md">Satellite View</h3>
-            <div className="flex items-center gap-2 mt-1">
-               <span className="px-1.5 py-0.5 rounded bg-white/10 border border-white/10 text-[10px] font-mono text-white/80 backdrop-blur-md">
-                 {lat.toFixed(5)}, {lng.toFixed(5)}
-               </span>
+        {/* --- Header --- */}
+        <div className="absolute top-0 left-0 right-0 z-[65] p-6 pt-8 flex justify-between items-start pointer-events-none bg-gradient-to-b from-black/80 to-transparent">
+            <div className="pointer-events-auto space-y-1">
+                <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse shadow-[0_0_10px_#22c55e]" />
+                    <h3 className="text-xl font-black text-white tracking-widest uppercase font-mono">Sat<span className="text-white/40">.Link</span></h3>
+                </div>
+                <button 
+                  onClick={handleCopy}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 active:scale-95 transition-all group"
+                >
+                    <span className={`text-[10px] font-mono tracking-wider ${copied ? 'text-green-400' : 'text-white/60 group-hover:text-white'}`}>
+                        {lat.toFixed(6)}, {lng.toFixed(6)}
+                    </span>
+                    {copied ? <Check className="w-3 h-3 text-green-400"/> : <Copy className="w-3 h-3 text-white/40 group-hover:text-white"/>}
+                </button>
             </div>
+            
+            <button onClick={onClose} className="pointer-events-auto p-3 rounded-full bg-white/5 border border-white/10 text-white hover:bg-white/10 active:scale-90 transition-all backdrop-blur-md">
+                <X className="w-5 h-5" />
+            </button>
         </div>
 
-        {/* Close Button */}
-        <button 
-          onClick={onClose} 
-          className="absolute top-6 right-6 z-[63] p-2.5 rounded-full bg-black/20 hover:bg-black/40 backdrop-blur-xl border border-white/10 text-white transition-all active:scale-90"
+        {/* --- Main Map Area --- */}
+        <div 
+           className="relative flex-1 w-full h-full overflow-hidden bg-[#111] touch-none cursor-grab active:cursor-grabbing"
+           ref={containerRef}
+           onPointerDown={handlePointerDown}
+           onPointerMove={handlePointerMove}
+           onPointerUp={handlePointerUp}
+           onPointerLeave={handlePointerUp}
+           onWheel={(e) => {
+             const factor = e.deltaY > 0 ? 0.9 : 1.1;
+             setViewState(prev => ({ ...prev, scale: Math.min(Math.max(prev.scale * factor, 0.5), 5) }));
+           }}
         >
-           <X className="w-5 h-5" />
-        </button>
-
-        {/* Zoom Controls (Right aligned, vertical pill) */}
-        <div className="absolute top-1/2 right-4 -translate-y-1/2 z-[63] flex flex-col gap-3">
-           <div className="flex flex-col bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden shadow-xl">
-             <button onClick={handleZoomIn} className="p-3.5 text-white hover:bg-white/10 active:bg-white/20 transition-colors border-b border-white/5">
-                <Plus className="w-6 h-6" />
-             </button>
-             <button onClick={handleZoomOut} className="p-3.5 text-white hover:bg-white/10 active:bg-white/20 transition-colors">
-                <Minus className="w-6 h-6" />
-             </button>
-           </div>
-        </div>
-
-        {/* Bottom Action Buttons */}
-        <div className="absolute bottom-10 left-6 right-6 z-[63] flex flex-col gap-3">
-            <div className="grid grid-cols-2 gap-3">
-                <button onClick={openAppleMaps} className="flex items-center justify-center gap-2 py-3.5 rounded-2xl bg-white text-black font-bold text-sm shadow-xl active:scale-[0.98] transition-transform">
-                    <MapPin className="w-4 h-4 fill-current" /> <span>Apple Maps</span>
-                </button>
-                <button onClick={openGoogleMaps} className="flex items-center justify-center gap-2 py-3.5 rounded-2xl bg-[#4285F4] text-white font-bold text-sm shadow-xl active:scale-[0.98] transition-transform">
-                    <LocateFixed className="w-4 h-4" /> <span>Google Maps</span>
-                </button>
-            </div>
-        </div>
-
-        <div className="w-full h-full rounded-t-3xl overflow-hidden relative bg-[#1a1a1a] mt-0 pt-0">
-          {isOpen && (
-             <img
-               src={mapUrl}
-               alt="Mapbox Satellite View"
-               onLoad={() => setImgLoaded(true)}
-               className={`w-full h-full object-cover transition-opacity duration-500 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
-               style={{ filter: 'grayscale(0.2) contrast(1.1) brightness(0.9)' }}
+             {/* Grid Overlay (Static) */}
+             <div className="absolute inset-0 pointer-events-none z-10 opacity-[0.07]" 
+                  style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }} 
              />
-          )}
-          <div className="absolute inset-0 flex items-center justify-center -z-10">
-             <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-          </div>
-          
-          {/* Map Grid Overlay for aesthetics - reduced opacity */}
-          <div className="absolute inset-0 pointer-events-none opacity-10"
-               style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '80px 80px' }} />
+             
+             {/* Center Crosshair (Static) */}
+             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none opacity-50">
+                  <div className="w-12 h-12 border border-white/30 rounded-full flex items-center justify-center">
+                      <div className="w-1 h-1 bg-green-500 rounded-full shadow-[0_0_8px_#22c55e]" />
+                  </div>
+                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[140%] h-[1px] bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-[140%] w-[1px] bg-gradient-to-b from-transparent via-white/20 to-transparent" />
+             </div>
+
+             {/* The Map Image */}
+             <div className="w-full h-full flex items-center justify-center transition-transform duration-75 will-change-transform"
+                  style={{ transform: `translate(${viewState.x}px, ${viewState.y}px) scale(${viewState.scale})` }}
+             >
+                {isOpen && !imgError && (
+                    <img
+                        src={mapUrl}
+                        alt="Satellite"
+                        draggable={false}
+                        onLoad={() => setImgLoaded(true)}
+                        onError={() => setImgError(true)}
+                        className={`max-w-none w-[800px] h-[1000px] object-cover transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+                        style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.9)' }}
+                    />
+                )}
+                {/* Fallback/Loading */}
+                {(!imgLoaded || imgError) && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center z-0">
+                        {imgError ? (
+                            <div className="text-center space-y-2">
+                                <WifiOff className="w-8 h-8 text-white/20 mx-auto" />
+                                <p className="text-[10px] font-mono text-white/40 uppercase tracking-widest">Map Data Unavailable</p>
+                            </div>
+                        ) : (
+                            <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
+                        )}
+                    </div>
+                )}
+             </div>
+        </div>
+
+        {/* --- Side Controls --- */}
+        <div className="absolute right-4 top-1/2 -translate-y-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
+             <div className="pointer-events-auto flex flex-col gap-2 bg-black/40 backdrop-blur-md p-1.5 rounded-2xl border border-white/10">
+                 <button onClick={zoomIn} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Plus className="w-5 h-5"/></button>
+                 <button onClick={resetView} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors text-[10px] font-bold font-mono">{Math.round(viewState.scale * 100)}%</button>
+                 <button onClick={zoomOut} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Minus className="w-5 h-5"/></button>
+             </div>
+        </div>
+
+        {/* --- Bottom Drawer Actions --- */}
+        <div className="absolute bottom-0 left-0 right-0 z-[65] p-6 bg-gradient-to-t from-black via-black/90 to-transparent">
+             <div className="grid grid-cols-2 gap-3 max-w-lg mx-auto">
+                 <button onClick={() => window.open(`http://maps.apple.com/?ll=${lat},${lng}&q=${lat},${lng}`, '_blank')} className="flex items-center justify-center gap-2 py-4 rounded-xl bg-white/10 hover:bg-white/20 border border-white/10 text-white font-bold text-xs uppercase tracking-wider backdrop-blur-md transition-all active:scale-[0.98]">
+                    <MapPin className="w-4 h-4" /> Apple Maps
+                 </button>
+                 <button onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${lat},${lng}`, '_blank')} className="flex items-center justify-center gap-2 py-4 rounded-xl bg-[#4285F4]/20 hover:bg-[#4285F4]/30 border border-[#4285F4]/30 text-[#4285F4] font-bold text-xs uppercase tracking-wider backdrop-blur-md transition-all active:scale-[0.98]">
+                    <LocateFixed className="w-4 h-4" /> Google Maps
+                 </button>
+             </div>
         </div>
       </div>
     </>
@@ -886,10 +944,11 @@ const FullMapDrawer = memo(({
 });
 FullMapDrawer.displayName = "FullMapDrawer";
 
+// --- MAIN COMPONENT ---
 export default function GeoLocation() {
   const { coords, error, loading } = useGeolocation();
   const { heading, trueHeading, requestAccess, permissionGranted, error: compassError } = useCompass();
-  useWakeLock(); // Prevent screen sleep
+  useWakeLock();
 
   const [address, setAddress] = useState<string | null>(null);
   const [weather, setWeather] = useState<WeatherData | null>(null);
@@ -899,8 +958,6 @@ export default function GeoLocation() {
   const [lastApiFetch, setLastApiFetch] = useState<{lat: number, lng: number} | null>(null);
   const [mounted, setMounted] = useState(false);
   const [isMapDrawerOpen, setIsMapDrawerOpen] = useState(false);
-  
-  // -- New States for Recording --
   const [isRecording, setIsRecording] = useState(false);
   const [recordedPath, setRecordedPath] = useState<GeoPoint[]>([]);
   const [showSaveButton, setShowSaveButton] = useState(false);
@@ -914,34 +971,26 @@ export default function GeoLocation() {
     return () => { isMountedRef.current = false; };
   }, []);
 
-  // Prevent accidental close while recording
-  useEffect(() => {
-    if (!isRecording) return;
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-      e.returnValue = '';
-    };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [isRecording]);
+  // HYBRID COMPASS LOGIC
+  // If moving faster than threshold, use GPS heading. Otherwise use Mag compass.
+  const isMoving = (coords?.speed ?? 0) > GPS_HEADING_THRESHOLD;
+  const effectiveHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined
+    ? coords.heading
+    : (heading ?? 0);
+  
+  const effectiveTrueHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined
+    ? coords.heading
+    : trueHeading;
 
+  // Recording Logic
   useEffect(() => {
     if (!coords) return;
+    const newPoint = { lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() };
 
-    const newPoint = { 
-      lat: coords.latitude, 
-      lng: coords.longitude, 
-      alt: coords.altitude, 
-      timestamp: Date.now() 
-    };
-
-    // Update visual path (limited trail)
     setPath(prev => {
       if (prev.length === 0) return [newPoint];
       const last = prev[prev.length - 1];
       const distance = getDistance(last.lat, last.lng, coords.latitude, coords.longitude);
-      
-      // Update trail if we moved enough
       if (distance > TRAIL_MIN_DISTANCE) {
         const newPath = [...prev, newPoint];
         return newPath.length > TRAIL_MAX_POINTS ? newPath.slice(newPath.length - TRAIL_MAX_POINTS) : newPath;
@@ -949,31 +998,23 @@ export default function GeoLocation() {
       return prev;
     });
 
-    // Handle Background Recording (Unlimited trail, strict noise filter)
     if (isRecording) {
       setRecordedPath(prev => {
         if (prev.length === 0) return [newPoint];
         const last = prev[prev.length - 1];
         const dist = getDistance(last.lat, last.lng, newPoint.lat, newPoint.lng);
-        
-        // NOISE REDUCTION: Only record if moved > REC_MIN_DISTANCE
-        if (dist >= REC_MIN_DISTANCE) {
-            return [...prev, newPoint];
-        }
+        if (dist >= REC_MIN_DISTANCE) return [...prev, newPoint];
         return prev;
       });
     }
-
   }, [coords, isRecording]);
 
   const toggleRecording = useCallback(() => {
     triggerHaptic();
     if (isRecording) {
-      // Stop recording
       setIsRecording(false);
       if (recordedPath.length > 0) setShowSaveButton(true);
     } else {
-      // Start recording
       setRecordedPath([]); 
       setShowSaveButton(false);
       setIsRecording(true);
@@ -983,7 +1024,6 @@ export default function GeoLocation() {
   const downloadGPX = useCallback(() => {
     triggerHaptic();
     if (recordedPath.length === 0) return;
-    
     const gpxString = generateGPX(recordedPath);
     const blob = new Blob([gpxString], { type: 'application/gpx+xml' });
     const url = URL.createObjectURL(blob);
@@ -994,25 +1034,29 @@ export default function GeoLocation() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    
     setShowSaveButton(false); 
   }, [recordedPath]);
 
-  const resetRadar = useCallback(() => { 
-    if (coords) setPath([{ lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() }]); 
-  }, [coords]);
+  const handleShare = async () => {
+    triggerHaptic();
+    if (!coords) return;
+    const text = `Lat: ${coords.latitude.toFixed(6)}, Lng: ${coords.longitude.toFixed(6)}`;
+    const url = `https://www.google.com/maps?q=${coords.latitude},${coords.longitude}`;
+    if (navigator.share) {
+      try { await navigator.share({ title: 'My Location', text, url }); } catch (err) { console.error(err); }
+    } else {
+      navigator.clipboard.writeText(`${text}\n${url}`);
+    }
+  };
 
-  const recenterMap = useCallback(() => resetRadar(), [resetRadar]);
+  const recenterMap = useCallback(() => { if (coords) setPath([{ lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() }]); }, [coords]);
   const toggleUnits = useCallback(() => { triggerHaptic(); setUnits(prev => prev === 'metric' ? 'imperial' : 'metric'); }, []);
   const toggleMapMode = useCallback(() => setMapMode(prev => prev === 'heading-up' ? 'north-up' : 'heading-up'), []);
-
   const debouncedCoords = useDebounce(coords, 2000);
 
-  // Fetch Weather / Address
+  // API Fetch
   useEffect(() => {
     if (!debouncedCoords) return;
-    
-    // Skip fetch if we haven't moved far enough to care (e.g., < 1km)
     if (lastApiFetch) {
         const distKm = getDistance(lastApiFetch.lat, lastApiFetch.lng, debouncedCoords.latitude, debouncedCoords.longitude) / 1000;
         if (distKm < API_FETCH_DISTANCE_THRESHOLD && address && weather) return;
@@ -1025,8 +1069,6 @@ export default function GeoLocation() {
       try {
         const { latitude, longitude } = debouncedCoords;
         const signal = abortControllerRef.current?.signal;
-        
-        // Fetch 2 days of daily data for solar cycle logic
         const [geoRes, weatherRes] = await Promise.allSettled([
           fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=14`, { signal }),
           fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m&daily=sunrise,sunset&forecast_days=2&timezone=auto`, { signal })
@@ -1055,19 +1097,17 @@ export default function GeoLocation() {
               description: info.label,
               windSpeed: data.current.wind_speed_10m,
               windDir: data.current.wind_direction_10m,
-              sunrise: data.daily.sunrise, // Array
-              sunset: data.daily.sunset    // Array
+              sunrise: data.daily.sunrise,
+              sunset: data.daily.sunset
             });
           } catch (e) {}
         }
-        
         setLastApiFetch({ lat: latitude, lng: longitude });
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') console.error(err);
       }
     };
     fetchData();
-    // Cleanup is handled by new abort controller on next run
   }, [debouncedCoords, lastApiFetch, address, weather]);
 
   const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
@@ -1075,15 +1115,12 @@ export default function GeoLocation() {
 
   return (
     <main className="relative flex flex-col items-center min-h-[100dvh] w-full bg-[#09090b] text-foreground p-4 md:p-8 overflow-x-hidden touch-manipulation font-sans selection:bg-green-500/30 pb-32">
-      
-      {/* Background Texture */}
       <div className="absolute inset-0 pointer-events-none z-0">
           <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(34,197,94,0.05),transparent_70%)]" />
-          <div className="absolute inset-0 opacity-[0.03]" 
-               style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '50px 50px' }} />
+          <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '50px 50px' }} />
       </div>
 
-      {/* Header / Top Bar */}
+      {/* Header */}
       <div className="w-full max-w-5xl flex justify-between items-start z-40 mb-6 shrink-0">
          <div className="flex flex-col">
              <h1 className="text-xs font-black tracking-[0.3em] text-muted-foreground/60 uppercase">Field Navigation</h1>
@@ -1094,53 +1131,40 @@ export default function GeoLocation() {
          </div>
 
          <div className="flex gap-2">
-            {/* RECORD BUTTON */}
             <button
                onClick={toggleRecording}
                className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all active:scale-95 ${
-                 isRecording 
-                   ? "bg-red-500/10 border-red-500/50 text-red-500" 
-                   : "bg-white/5 border-white/5 text-muted-foreground hover:bg-white/10"
+                 isRecording ? "bg-red-500/10 border-red-500/50 text-red-500" : "bg-white/5 border-white/5 text-muted-foreground hover:bg-white/10"
                }`}
             >
                {isRecording ? <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> : <Circle className="w-2 h-2" />}
                {isRecording ? "REC" : "LOG"}
             </button>
-
-             <button 
-               onClick={toggleUnits} 
-               type="button"
-               className="px-3 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground transition-all active:scale-95"
-             >
+            <button onClick={toggleUnits} className="px-3 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground transition-all active:scale-95">
                {units === 'metric' ? 'MET' : 'IMP'}
-             </button>
+            </button>
          </div>
       </div>
 
       <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 z-10">
-        
         {loading && !coords && (
           <div className="flex flex-col items-center justify-center h-64 space-y-6 animate-pulse">
             <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
-            <span className="text-xs tracking-[0.3em] uppercase text-green-500/70 font-bold">Initializing GPS...</span>
+            <span className="text-xs tracking-[0.3em] uppercase text-green-500/70 font-bold">Acquiring GPS Signal...</span>
           </div>
         )}
 
         {error && !coords && (
            <Alert variant="destructive" className="max-w-md bg-red-950/20 border-red-900/50 text-red-200">
              <AlertCircle className="h-4 w-4" />
-             <AlertTitle>GPS Signal Lost</AlertTitle>
-             <AlertDescription>{error}. Check device permissions.</AlertDescription>
+             <AlertTitle>Signal Error</AlertTitle>
+             <AlertDescription>{error}. Check device location settings.</AlertDescription>
            </Alert>
         )}
 
-        {/* SAVE GPX BUTTON OVERLAY */}
         {showSaveButton && !isRecording && (
           <div className="w-full max-w-md animate-in slide-in-from-top-4 fade-in">
-             <button 
-               onClick={downloadGPX}
-               className="w-full py-4 rounded-xl bg-green-500 text-black font-bold uppercase tracking-widest shadow-[0_0_20px_rgba(34,197,94,0.4)] flex items-center justify-center gap-2 active:scale-95 transition-transform"
-             >
+             <button onClick={downloadGPX} className="w-full py-4 rounded-xl bg-green-500 text-black font-bold uppercase tracking-widest shadow-[0_0_20px_rgba(34,197,94,0.4)] flex items-center justify-center gap-2 active:scale-95 transition-transform">
                 <Download className="w-5 h-5" /> Download Mission Log
              </button>
           </div>
@@ -1149,61 +1173,45 @@ export default function GeoLocation() {
         {coords && (
           <div className="w-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-12 gap-8 animate-in fade-in slide-in-from-bottom-8 duration-700">
              
-             {/* Left Column: Coordinates & Stats */}
+             {/* Left Column */}
              <div className="lg:col-span-4 flex flex-col gap-4 order-2 md:order-1">
-                 
-                 {/* Coordinates Module */}
                  <div className="bg-card/30 backdrop-blur-sm border border-white/5 rounded-3xl p-5 space-y-3">
                     <div className="flex items-center justify-between mb-2">
                         <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-widest">Position</span>
-                        <MapPin className="w-3 h-3 text-green-500" />
+                        <div className="flex gap-2">
+                          <button onClick={handleShare} className="p-1.5 hover:bg-white/10 rounded-full text-muted-foreground hover:text-white transition-colors"><Share2 className="w-3.5 h-3.5" /></button>
+                          <Signal className={`w-3.5 h-3.5 ${(coords.accuracy || 100) < 15 ? 'text-green-500' : (coords.accuracy || 100) < 50 ? 'text-yellow-500' : 'text-red-500'}`} />
+                        </div>
                     </div>
                     <CoordinateRow label="Latitude" value={coords.latitude} type="lat" />
                     <CoordinateRow label="Longitude" value={coords.longitude} type="lng" />
-                    
-                    <button 
-                      type="button"
-                      onClick={() => { triggerHaptic(); setIsMapDrawerOpen(true); }}
-                      className="w-full mt-2 py-3 rounded-xl bg-green-500/10 hover:bg-green-500/20 text-green-500 text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 transition-colors active:scale-[0.98]"
-                    >
-                      <MapPin className="w-3 h-3" /> View Map
+                    <button onClick={() => { triggerHaptic(); setIsMapDrawerOpen(true); }} className="w-full mt-2 py-3 rounded-xl bg-green-500/10 hover:bg-green-500/20 text-green-500 text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 transition-colors active:scale-[0.98]">
+                      <MapPin className="w-3 h-3" /> Satellite Map
                     </button>
                  </div>
 
-                 {/* Stats Grid */}
                  <div className="grid grid-cols-3 gap-3">
                     <StatCard icon={Mountain} label="Alt" value={convertAltitude(coords.altitude, units)} unit={units === 'metric' ? 'm' : 'ft'} />
                     <StatCard icon={Activity} label="Spd" value={convertSpeed(coords.speed, units)} unit={units === 'metric' ? 'km/h' : 'mph'} />
                     <StatCard icon={Navigation} label="Acc" value={coords.accuracy ? `±${Math.round(coords.accuracy)}` : '--'} unit="m" />
                  </div>
 
-                 {/* Solar Intel Card */}
-                 {weather && weather.sunrise && (
-                    <SolarCard sunrise={weather.sunrise} sunset={weather.sunset} />
-                 )}
-
-                 {/* Weather Pill */}
+                 {weather && weather.sunrise && <SolarCard sunrise={weather.sunrise} sunset={weather.sunset} />}
+                 
                  {weather && (
                    <div className="flex items-center justify-between p-4 rounded-2xl bg-gradient-to-r from-blue-500/10 to-transparent border border-blue-500/10">
                       <div className="flex items-center gap-3">
-                          <div className="p-2 rounded-full bg-blue-500/20 text-blue-400">
-                            <WeatherIcon className="w-4 h-4" />
-                          </div>
+                          <div className="p-2 rounded-full bg-blue-500/20 text-blue-400"><WeatherIcon className="w-4 h-4" /></div>
                           <div className="flex flex-col">
                              <span className="text-lg font-bold tabular-nums leading-none">{convertTemp(weather.temp, units)}</span>
                              <div className="flex items-center gap-2 mt-1">
                                <span className="text-[9px] uppercase font-bold text-muted-foreground tracking-wide">{weather.description}</span>
                                <span className="text-[9px] text-muted-foreground/50">•</span>
-                               <div className="flex items-center gap-1 text-[9px] font-bold text-muted-foreground">
-                                  <Wind className="w-3 h-3" />
-                                  {convertSpeed(weather.windSpeed / 3.6, units)}
-                               </div>
+                               <div className="flex items-center gap-1 text-[9px] font-bold text-muted-foreground"><Wind className="w-3 h-3" />{convertSpeed(weather.windSpeed / 3.6, units)}</div>
                              </div>
                           </div>
                       </div>
-                      <div className="text-right">
-                         <span className="text-[9px] uppercase font-bold text-muted-foreground block">{address ? address.split(',')[0] : "Local"}</span>
-                      </div>
+                      <div className="text-right"><span className="text-[9px] uppercase font-bold text-muted-foreground block">{address ? address.split(',')[0] : "Local"}</span></div>
                    </div>
                  )}
              </div>
@@ -1211,47 +1219,38 @@ export default function GeoLocation() {
              {/* Center Column: Visuals */}
              <div className="lg:col-span-8 flex flex-col md:flex-row items-center justify-center gap-12 order-1 md:order-2 p-0">
                  <CompassDisplay 
-                    heading={heading} 
-                    trueHeading={trueHeading} 
+                    heading={effectiveHeading} 
+                    trueHeading={effectiveTrueHeading} 
                     onClick={requestAccess} 
                     hasError={!!compassError} 
-                    permissionGranted={permissionGranted} 
+                    permissionGranted={permissionGranted}
+                    source={isMoving ? 'GPS' : 'MAG'}
                  />
-                 
                  <div className="h-px w-32 md:w-px md:h-32 bg-white/10" />
-
                  <div className="flex flex-col items-center gap-6">
                     <RadarMapbox 
                       path={path} 
                       lat={coords.latitude} 
                       lng={coords.longitude} 
-                      heading={heading || 0}
+                      heading={effectiveHeading || 0}
                       mode={mapMode}
+                      accuracy={coords.accuracy}
                       onRecenter={recenterMap}
                       onToggleMode={toggleMapMode}
                     />
                     {path.length > 1 && (
-                      <button 
-                        onClick={() => { triggerHaptic(); resetRadar(); }} 
-                        className="text-[9px] text-muted-foreground hover:text-red-400 uppercase tracking-widest font-bold flex items-center gap-2 transition-colors py-2 px-4 rounded-full hover:bg-white/5"
-                      >
-                        <Trash2 className="w-3 h-3" /> Clear Trail
+                      <button onClick={() => { triggerHaptic(); recenterMap(); }} className="text-[9px] text-muted-foreground hover:text-red-400 uppercase tracking-widest font-bold flex items-center gap-2 transition-colors py-2 px-4 rounded-full hover:bg-white/5">
+                        <Trash2 className="w-3 h-3" /> Clear Visual Trail
                       </button>
                     )}
                  </div>
              </div>
-
           </div>
         )}
       </div>
 
       {coords && (
-        <FullMapDrawer 
-          isOpen={isMapDrawerOpen} 
-          onClose={() => setIsMapDrawerOpen(false)} 
-          lat={coords.latitude} 
-          lng={coords.longitude} 
-        />
+        <FullMapDrawer isOpen={isMapDrawerOpen} onClose={() => setIsMapDrawerOpen(false)} lat={coords.latitude} lng={coords.longitude} />
       )}
     </main>
   );
