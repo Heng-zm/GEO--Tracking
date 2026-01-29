@@ -7,7 +7,7 @@ import {
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
   Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan,
-  ArrowUp, Hand, Video, VideoOff, Eye, Zap, Aperture, Target
+  ArrowUp, Hand, Video, VideoOff, Eye, Zap, Aperture, Target, Upload, Image as ImageIcon
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -15,7 +15,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import Webcam from "react-webcam";
 import * as tf from "@tensorflow/tfjs";
 import * as handpose from "@tensorflow-models/handpose";
-import * as cocoSsd from "@tensorflow-models/coco-ssd"; // IMPORT COCO-SSD
+import * as cocoSsd from "@tensorflow-models/coco-ssd";
 import '@tensorflow/tfjs-backend-webgl';
 
 // --- Mapbox GL JS ---
@@ -380,12 +380,16 @@ const useDebounce = <T,>(value: T, delay: number): T => {
   return debouncedValue;
 };
 
-// --- TACTICAL SCANNER (Object Detection) ---
+// --- TACTICAL SCANNER (Object Detection + Upload) ---
 const TacticalScanner = memo(() => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const imageRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  
   const [model, setModel] = useState<cocoSsd.ObjectDetection | null>(null);
   const [loading, setLoading] = useState(true);
+  const [imageFile, setImageFile] = useState<string | null>(null);
   const isMountedRef = useRef(true);
 
   // Load COCO-SSD
@@ -395,7 +399,7 @@ const TacticalScanner = memo(() => {
       try {
         await tf.ready();
         await tf.setBackend('webgl');
-        const loadedModel = await cocoSsd.load({ base: 'lite_mobilenet_v2' }); // Use lightweight version
+        const loadedModel = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
         if (isMountedRef.current) {
           setModel(loadedModel);
           setLoading(false);
@@ -408,103 +412,186 @@ const TacticalScanner = memo(() => {
     return () => { isMountedRef.current = false; };
   }, []);
 
-  // Detection Loop
+  // Helper to draw boxes
+  const drawPredictions = (predictions: cocoSsd.DetectedObject[], canvas: HTMLCanvasElement) => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    // Clear previous drawings
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.font = '14px "Courier New", monospace';
+    ctx.lineWidth = 2;
+
+    predictions.forEach(prediction => {
+      const [x, y, width, height] = prediction.bbox;
+      const label = prediction.class.toUpperCase();
+      const score = Math.round(prediction.score * 100);
+
+      // Draw Brackets (Tactical Style)
+      ctx.strokeStyle = '#22c55e'; // Green
+      ctx.fillStyle = '#22c55e';
+      
+      // Box
+      ctx.strokeRect(x, y, width, height);
+      
+      // Label BG
+      ctx.fillRect(x, y - 20, ctx.measureText(`${label} ${score}%`).width + 10, 20);
+      
+      // Text
+      ctx.fillStyle = '#000';
+      ctx.fillText(`${label} ${score}%`, x + 5, y - 5);
+    });
+  };
+
+  // Webcam Detection Loop
   useEffect(() => {
-    if (!model) return;
+    if (!model || imageFile) return; // Stop loop if image uploaded
     let rafId: number;
     let timeoutId: NodeJS.Timeout;
-    const DETECTION_INTERVAL = 150; // Throttle to save battery
+    const DETECTION_INTERVAL = 150; 
 
-    const detect = async () => {
+    const detectWebcam = async () => {
       if (!isMountedRef.current) return;
       if (videoRef.current && videoRef.current.readyState === 4 && canvasRef.current) {
         
-        // Get Predictions
-        const predictions = await model.detect(videoRef.current, 5, 0.5); // Max 5 objects, 50% threshold
+        const predictions = await model.detect(videoRef.current, 5, 0.5);
 
         if (isMountedRef.current && canvasRef.current) {
-          const ctx = canvasRef.current.getContext('2d');
-          if (ctx && videoRef.current) {
-            // Match canvas size to video
+            // Sync canvas dimensions
             canvasRef.current.width = videoRef.current.videoWidth;
             canvasRef.current.height = videoRef.current.videoHeight;
-            
-            // Clear & Draw
-            ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-            ctx.font = '14px "Courier New", monospace';
-            ctx.lineWidth = 2;
-
-            predictions.forEach(prediction => {
-              const [x, y, width, height] = prediction.bbox;
-              const label = prediction.class.toUpperCase();
-              const score = Math.round(prediction.score * 100);
-
-              // Draw Brackets (Tactical Style)
-              ctx.strokeStyle = '#22c55e'; // Green
-              ctx.fillStyle = '#22c55e';
-              
-              // Box
-              ctx.strokeRect(x, y, width, height);
-              
-              // Label BG
-              ctx.fillRect(x, y - 20, ctx.measureText(`${label} ${score}%`).width + 10, 20);
-              
-              // Text
-              ctx.fillStyle = '#000';
-              ctx.fillText(`${label} ${score}%`, x + 5, y - 5);
-            });
-          }
+            drawPredictions(predictions, canvasRef.current);
         }
       }
       
       timeoutId = setTimeout(() => {
-        rafId = requestAnimationFrame(detect);
+        rafId = requestAnimationFrame(detectWebcam);
       }, DETECTION_INTERVAL);
     };
 
-    detect();
+    detectWebcam();
     return () => { 
       cancelAnimationFrame(rafId);
       clearTimeout(timeoutId);
     };
-  }, [model]);
+  }, [model, imageFile]);
+
+  // Static Image Detection Trigger
+  const detectImage = async () => {
+    if (model && imageRef.current && canvasRef.current) {
+        const img = imageRef.current;
+        if (img.complete && img.naturalWidth !== 0) {
+             canvasRef.current.width = img.width;
+             canvasRef.current.height = img.height;
+             const predictions = await model.detect(img, 10, 0.3); // More objects, lower threshold for static images
+             drawPredictions(predictions, canvasRef.current);
+        }
+    }
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    triggerHaptic();
+    const file = e.target.files?.[0];
+    if (file) {
+        const url = URL.createObjectURL(file);
+        setImageFile(url);
+    }
+  };
+
+  const clearImage = () => {
+      triggerHaptic();
+      if (imageFile) URL.revokeObjectURL(imageFile);
+      setImageFile(null);
+      // Clear canvas immediately
+      if (canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+      }
+  };
 
   return (
-    <div className="absolute inset-0 z-50 bg-black">
-        {/* Webcam Feed (Back Camera) */}
-        <Webcam
-          ref={(webcam: any) => { videoRef.current = webcam?.video || null; }}
-          className="absolute inset-0 w-full h-full object-cover"
-          videoConstraints={{ facingMode: "environment" }}
-          muted
-        />
-        {/* HUD Overlay Canvas */}
-        <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-cover" />
-        
-        {/* Loading State */}
-        {loading && (
-           <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-50">
-              <div className="flex flex-col items-center gap-4">
-                 <Loader2 className="w-12 h-12 text-green-500 animate-spin" />
-                 <span className="text-green-500 font-mono tracking-widest animate-pulse">LOADING OPTICS...</span>
-              </div>
-           </div>
-        )}
+    <div className="absolute inset-0 z-50 bg-black flex flex-col">
+        {/* Media Container */}
+        <div className="relative flex-1 w-full h-full overflow-hidden bg-black/90 flex items-center justify-center">
+            
+            {imageFile ? (
+                <img 
+                    ref={imageRef}
+                    src={imageFile}
+                    alt="Analysis Target"
+                    className="max-w-full max-h-full object-contain"
+                    onLoad={detectImage}
+                />
+            ) : (
+                <Webcam
+                    ref={(webcam: any) => { videoRef.current = webcam?.video || null; }}
+                    className="absolute inset-0 w-full h-full object-cover"
+                    videoConstraints={{ facingMode: "environment" }}
+                    muted
+                />
+            )}
 
-        {/* UI Overlay */}
-        <div className="absolute top-4 left-4 flex gap-2">
+            {/* HUD Overlay Canvas - Positioned absolute to cover the container, 
+                but width/height set dynamically by JS to match source */}
+            <canvas ref={canvasRef} className="absolute pointer-events-none" style={imageFile ? { position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', maxWidth: '100%', maxHeight: '100%' } : { width: '100%', height: '100%' }} />
+            
+            {/* Loading State */}
+            {loading && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-50">
+                <div className="flex flex-col items-center gap-4">
+                    <Loader2 className="w-12 h-12 text-green-500 animate-spin" />
+                    <span className="text-green-500 font-mono tracking-widest animate-pulse">LOADING OPTICS...</span>
+                </div>
+            </div>
+            )}
+
+            {/* Crosshair Overlay (Only for Webcam) */}
+            {!imageFile && (
+                <div className="absolute inset-0 pointer-events-none flex items-center justify-center opacity-30">
+                    <div className="w-64 h-64 border border-white/30 rounded-full flex items-center justify-center">
+                        <div className="w-1 h-2 bg-white/50" />
+                    </div>
+                    <div className="absolute w-full h-px bg-white/10" />
+                    <div className="absolute h-full w-px bg-white/10" />
+                </div>
+            )}
+        </div>
+
+        {/* UI Overlay Controls */}
+        <div className="absolute top-4 left-4 flex gap-2 z-[60]">
             <div className="px-3 py-1 bg-green-500/20 border border-green-500/50 text-green-500 text-xs font-black tracking-widest rounded uppercase animate-pulse">
-                Scanner Active
+                {imageFile ? "STATIC ANALYSIS" : "LIVE FEED"}
             </div>
         </div>
-        
-        {/* Crosshair Overlay */}
-        <div className="absolute inset-0 pointer-events-none flex items-center justify-center opacity-30">
-            <div className="w-64 h-64 border border-white/30 rounded-full flex items-center justify-center">
-                <div className="w-1 h-2 bg-white/50" />
-            </div>
-            <div className="absolute w-full h-px bg-white/10" />
-            <div className="absolute h-full w-px bg-white/10" />
+
+        {/* Bottom Controls */}
+        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 z-[60]">
+            {/* Upload Button */}
+            <input 
+                type="file" 
+                ref={fileInputRef} 
+                className="hidden" 
+                accept="image/*" 
+                onChange={handleFileUpload} 
+            />
+            <button 
+                onClick={() => fileInputRef.current?.click()}
+                className="p-4 rounded-full bg-black/50 border border-green-500/50 text-green-500 backdrop-blur-md active:scale-95 transition-all hover:bg-green-900/20"
+                aria-label="Upload Image"
+            >
+                <Upload className="w-6 h-6" />
+            </button>
+
+            {/* Clear Image Button (Only visible if image loaded) */}
+            {imageFile && (
+                <button 
+                    onClick={clearImage}
+                    className="p-4 rounded-full bg-red-900/50 border border-red-500/50 text-white backdrop-blur-md active:scale-95 transition-all"
+                    aria-label="Clear Image"
+                >
+                    <Trash2 className="w-6 h-6" />
+                </button>
+            )}
         </div>
     </div>
   );
