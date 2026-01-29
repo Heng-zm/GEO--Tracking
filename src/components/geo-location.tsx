@@ -6,9 +6,16 @@ import {
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
-  Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan
+  Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan,
+  ArrowUp, Hand, Video, VideoOff, Eye
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+
+// --- TensorFlow & Webcam ---
+import Webcam from "react-webcam";
+import * as tf from "@tensorflow/tfjs";
+import * as handpose from "@tensorflow-models/handpose";
+import '@tensorflow/tfjs-backend-webgl';
 
 // --- Mapbox GL JS ---
 import mapboxgl from 'mapbox-gl';
@@ -18,7 +25,7 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 mapboxgl.accessToken = MAPBOX_TOKEN;
 
-const RADAR_ZOOM = 18;
+const RADAR_ZOOM = 18; // <--- Restored this constant
 const TRAIL_MAX_POINTS = 100; 
 const TRAIL_MIN_DISTANCE = 5; 
 const MAP_UPDATE_THRESHOLD = 80; 
@@ -58,9 +65,7 @@ type WeatherData = {
 };
 
 type GeoPoint = { lat: number; lng: number; alt: number | null; timestamp: number };
-
 type UnitSystem = 'metric' | 'imperial';
-
 type MapMode = 'heading-up' | 'north-up';
 type MapStyle = 'satellite' | 'dark';
 
@@ -72,7 +77,7 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 // --- Helpers ---
 const triggerHaptic = () => {
   if (typeof navigator !== 'undefined' && navigator.vibrate) {
-    navigator.vibrate(10);
+    navigator.vibrate(20);
   }
 };
 
@@ -83,22 +88,16 @@ const formatCoordinate = (value: number, type: 'lat' | 'lng'): string => {
 
 const convertSpeed = (ms: number | null, system: UnitSystem): string => {
   if (ms === null || ms < 0) return "0.0";
-  return system === 'metric' 
-    ? `${(ms * 3.6).toFixed(1)}` 
-    : `${(ms * 2.23694).toFixed(1)}`;
+  return system === 'metric' ? `${(ms * 3.6).toFixed(1)}` : `${(ms * 2.23694).toFixed(1)}`;
 };
 
 const convertAltitude = (meters: number | null, system: UnitSystem): string => {
   if (meters === null) return "--";
-  return system === 'metric'
-    ? `${Math.round(meters)}`
-    : `${Math.round(meters * 3.28084)}`;
+  return system === 'metric' ? `${Math.round(meters)}` : `${Math.round(meters * 3.28084)}`;
 };
 
 const convertTemp = (celsius: number, system: UnitSystem): string => {
-  return system === 'metric'
-    ? `${celsius.toFixed(1)}°`
-    : `${((celsius * 9/5) + 32).toFixed(1)}°`;
+  return system === 'metric' ? `${celsius.toFixed(1)}°` : `${((celsius * 9/5) + 32).toFixed(1)}°`;
 };
 
 const formatTime = (isoString: string) => {
@@ -209,15 +208,10 @@ const useWakeLock = () => {
 
   useEffect(() => {
     requestLock();
-
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        requestLock();
-      } else {
-        releaseLock();
-      }
+      if (document.visibilityState === 'visible') requestLock();
+      else releaseLock();
     };
-
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       releaseLock();
@@ -272,7 +266,7 @@ const useGeolocation = () => {
       switch(error.code) {
         case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
         case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return; // Don't reset state on timeout, just wait
+        case error.TIMEOUT: return;
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
@@ -302,7 +296,6 @@ const useCompass = () => {
   const currentPitchRef = useRef<number>(0);
   const targetRollRef = useRef<number>(0);
   const currentRollRef = useRef<number>(0);
-
   const rafIdRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
 
@@ -313,14 +306,11 @@ const useCompass = () => {
   
   useEffect(() => {
     if (!permissionGranted) return;
-    
     const loop = () => {
       if (!isRunningRef.current) return;
-
-      // Heading Smoothing
+      
       const hDiff = targetHeadingRef.current - currentHeadingRef.current;
       if (Math.abs(hDiff) > 0.1) {
-          // Weighted averaging for smoothness
           currentHeadingRef.current += hDiff * 0.1;
           setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
       } else if (currentHeadingRef.current !== targetHeadingRef.current) {
@@ -328,27 +318,21 @@ const useCompass = () => {
           setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
       }
 
-      // Pitch Smoothing
       const pDiff = targetPitchRef.current - currentPitchRef.current;
       if (Math.abs(pDiff) > 0.1) {
           currentPitchRef.current += pDiff * 0.1;
           setPitch(currentPitchRef.current);
       }
 
-      // Roll Smoothing
       const rDiff = targetRollRef.current - currentRollRef.current;
       if (Math.abs(rDiff) > 0.1) {
           currentRollRef.current += rDiff * 0.1;
           setRoll(currentRollRef.current);
       }
-      
       rafIdRef.current = requestAnimationFrame(loop);
     };
-
     rafIdRef.current = requestAnimationFrame(loop);
-    return () => { 
-      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); 
-    };
+    return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [permissionGranted]);
 
   const requestAccess = useCallback(async () => {
@@ -370,35 +354,24 @@ const useCompass = () => {
 
   useEffect(() => {
     if (!permissionGranted || typeof window === 'undefined') return;
-
     const handleOrientation = (e: any) => {
       let degree: number | null = null;
-      if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
-        // iOS
-        degree = e.webkitCompassHeading;
-      } else if (e.alpha !== null) {
-        // Android/Non-iOS
-        degree = Math.abs(360 - e.alpha);
-      }
+      if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) degree = e.webkitCompassHeading;
+      else if (e.alpha !== null) degree = Math.abs(360 - e.alpha);
 
       if (degree !== null) {
         const normalized = ((degree) + 360) % 360;
         setTrueHeading(normalized);
         const current = targetHeadingRef.current;
         const currentMod = (current % 360 + 360) % 360;
-        
         let delta = normalized - currentMod;
-        // Shortest path interpolation logic
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
         targetHeadingRef.current = current + delta;
       }
-
       if (e.beta !== null) targetPitchRef.current = e.beta;
       if (e.gamma !== null) targetRollRef.current = e.gamma;
     };
-
-    // Prefer absolute orientation if available (more accurate on Android)
     const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
     window.addEventListener(eventName, handleOrientation, true);
     return () => window.removeEventListener(eventName, handleOrientation, true);
@@ -416,45 +389,165 @@ const useDebounce = <T,>(value: T, delay: number): T => {
   return debouncedValue;
 };
 
-// --- UI Components ---
+// --- GESTURE COMPONENT ---
+const GestureOps = memo(({ 
+  onToggleRecording, 
+  onToggleMapMode,
+  isRecording 
+}: { 
+  onToggleRecording: () => void, 
+  onToggleMapMode: () => void,
+  isRecording: boolean
+}) => {
+  const webcamRef = useRef<Webcam>(null);
+  const [model, setModel] = useState<handpose.HandPose | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [gestureState, setGestureState] = useState<'neutral' | 'pinch' | 'fist'>('neutral');
+  const [debugMsg, setDebugMsg] = useState("Initializing AI...");
 
+  // Load Handpose Model
+  useEffect(() => {
+    const loadModel = async () => {
+      try {
+        await tf.setBackend('webgl');
+        const net = await handpose.load();
+        setModel(net);
+        setLoading(false);
+        setDebugMsg("Ops Ready");
+      } catch (e) {
+        console.error("AI Load Failed", e);
+        setDebugMsg("AI Error");
+      }
+    };
+    loadModel();
+  }, []);
+
+  // Detection Loop
+  useEffect(() => {
+    if (!model) return;
+
+    let rafId: number;
+    let lastActionTime = 0;
+    const COOLDOWN = 1000; // ms between actions
+
+    const detect = async () => {
+      if (
+        typeof webcamRef.current !== "undefined" &&
+        webcamRef.current !== null &&
+        webcamRef.current.video?.readyState === 4
+      ) {
+        const video = webcamRef.current.video;
+        const hands = await model.estimateHands(video);
+
+        if (hands.length > 0) {
+          const landmarks = hands[0].landmarks;
+
+          // 1. PINCH DETECTION (Thumb tip to Index tip)
+          const thumbTip = landmarks[4];
+          const indexTip = landmarks[8];
+          const pinkyTip = landmarks[20];
+          // const palmBase = landmarks[0];
+
+          const pinchDist = Math.sqrt(
+            Math.pow(thumbTip[0] - indexTip[0], 2) +
+            Math.pow(thumbTip[1] - indexTip[1], 2)
+          );
+
+          // 2. FIST DETECTION (Fingertips close to palm base or simply thumb close to pinky)
+          // Simplified: Thumb tip close to Pinky tip implies closed hand
+          const fistDist = Math.sqrt(
+            Math.pow(thumbTip[0] - pinkyTip[0], 2) +
+            Math.pow(thumbTip[1] - pinkyTip[1], 2)
+          );
+
+          const now = Date.now();
+
+          // Thresholds depend on camera distance, roughly calibrated here
+          if (pinchDist < 30) {
+            setGestureState('pinch');
+            if (now - lastActionTime > COOLDOWN) {
+              triggerHaptic();
+              onToggleMapMode();
+              setDebugMsg("Map Mode Toggled");
+              lastActionTime = now;
+            }
+          } else if (fistDist < 30) {
+            setGestureState('fist');
+            if (now - lastActionTime > COOLDOWN) {
+              triggerHaptic();
+              onToggleRecording();
+              setDebugMsg(isRecording ? "Rec Stopped" : "Rec Started");
+              lastActionTime = now;
+            }
+          } else {
+            setGestureState('neutral');
+            setDebugMsg("Scanning...");
+          }
+        } else {
+          setGestureState('neutral');
+        }
+      }
+      rafId = requestAnimationFrame(detect);
+    };
+
+    detect();
+    return () => cancelAnimationFrame(rafId);
+  }, [model, onToggleRecording, onToggleMapMode, isRecording]);
+
+  return (
+    <div className="absolute top-20 right-4 w-28 h-36 bg-black/80 rounded-xl border border-green-500/30 overflow-hidden z-50 shadow-2xl backdrop-blur-md">
+       <Webcam
+          ref={webcamRef}
+          className="absolute inset-0 w-full h-full object-cover opacity-60 grayscale"
+          mirrored={true}
+          videoConstraints={{ width: 200, height: 200, facingMode: "user" }}
+       />
+       
+       <div className="absolute inset-0 flex flex-col items-center justify-between p-2 pointer-events-none">
+          {loading ? (
+            <Loader2 className="w-6 h-6 animate-spin text-green-500 mt-8" />
+          ) : (
+             <div className="mt-8">
+               {gestureState === 'neutral' && <Hand className="w-8 h-8 text-white/50" />}
+               {gestureState === 'pinch' && <Scan className="w-8 h-8 text-green-400 animate-pulse" />}
+               {gestureState === 'fist' && <Circle className="w-8 h-8 text-red-400 fill-red-400 animate-pulse" />}
+             </div>
+          )}
+          
+          <div className="w-full bg-black/60 backdrop-blur-sm rounded text-[8px] font-mono text-center py-1 text-green-400 border-t border-green-500/20">
+             {debugMsg}
+          </div>
+       </div>
+
+       {/* Corner Accents */}
+       <div className="absolute top-0 left-0 w-2 h-2 border-l border-t border-green-500/50" />
+       <div className="absolute top-0 right-0 w-2 h-2 border-r border-t border-green-500/50" />
+       <div className="absolute bottom-0 left-0 w-2 h-2 border-l border-b border-green-500/50" />
+       <div className="absolute bottom-0 right-0 w-2 h-2 border-r border-b border-green-500/50" />
+    </div>
+  );
+});
+GestureOps.displayName = "GestureOps";
+
+// --- UI Components ---
 const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number | null }) => {
   const p = pitch || 0;
   const r = roll || 0;
-  
   const visualP = Math.max(Math.min(p, 60), -60);
   const pxPerDeg = 2; 
 
   return (
     <div className="relative w-40 h-40 shrink-0 rounded-full border-[6px] border-[#1a1a1a] bg-[#0c0c0c] overflow-hidden shadow-2xl ring-1 ring-white/10 group select-none">
-       {/* Outer Mechanical Bezel */}
        <div className="absolute inset-0 rounded-full border-2 border-white/5 pointer-events-none z-30" />
-       
        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-0.5 h-1.5 bg-yellow-500 z-40" />
        <div className="absolute top-0.5 left-1/2 -translate-x-1/2 -translate-y-1/2 w-0 h-0 border-l-[4px] border-l-transparent border-r-[4px] border-r-transparent border-b-[6px] border-b-yellow-500 z-40" />
-
-      {/* Attitude Layer */}
-      <div 
-        className="absolute inset-[-50%] will-change-transform origin-center"
-        style={{ 
-          transform: `rotate(${-r}deg) translateY(${visualP * pxPerDeg}px)`,
-          transition: 'transform 0.1s linear'
-        }}
-      >
+      <div className="absolute inset-[-50%] will-change-transform origin-center" style={{ transform: `rotate(${-r}deg) translateY(${visualP * pxPerDeg}px)`, transition: 'transform 0.1s linear' }}>
         <div className="w-full h-1/2 bg-[#0066cc]/30 border-b-2 border-white/80 shadow-[0_0_10px_rgba(255,255,255,0.2)]" /> 
         <div className="w-full h-1/2 bg-[#663300]/40 border-t-2 border-white/80 shadow-[0_0_10px_rgba(255,255,255,0.2)]" /> 
-        
-        {/* Horizon Line */}
         <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-white/50" />
-
-        {/* Pitch Ladder */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full h-full pointer-events-none">
             {PITCH_LADDER_LINES.map(deg => (
-                <div 
-                    key={deg} 
-                    className="absolute left-1/2 -translate-x-1/2 flex items-center justify-center gap-2 w-full opacity-60"
-                    style={{ top: `calc(50% - ${deg * pxPerDeg}px)` }}
-                >
+                <div key={deg} className="absolute left-1/2 -translate-x-1/2 flex items-center justify-center gap-2 w-full opacity-60" style={{ top: `calc(50% - ${deg * pxPerDeg}px)` }}>
                     <span className="text-[6px] font-mono font-bold text-white/90 w-3 text-right drop-shadow-md">{Math.abs(deg)}</span>
                     <div className="h-px bg-white/80 w-6 shadow-[0_0_2px_black]" />
                     <span className="text-[6px] font-mono font-bold text-white/90 w-3 text-left drop-shadow-md">{Math.abs(deg)}</span>
@@ -462,8 +555,6 @@ const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number
             ))}
         </div>
       </div>
-
-      {/* Fixed Aircraft Reference */}
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
         <div className="w-1.5 h-1.5 bg-yellow-400 rounded-full shadow-[0_0_4px_rgba(250,204,21,1)] z-10 border border-black/20" />
         <div className="absolute flex gap-8">
@@ -471,19 +562,13 @@ const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number
              <div className="w-8 h-1 bg-yellow-400/80 rounded-full shadow-sm" />
         </div>
       </div>
-      
-      {/* Banking Scale */}
       <div className="absolute top-2 inset-x-0 flex justify-center z-20 pointer-events-none">
            <div className="w-24 h-24 rounded-full border-t border-white/30 absolute top-0 mask-image-gradient" />
            {BANKING_SCALE_TICKS.map(deg => (
                <div key={deg} className="absolute top-0 h-2 w-px bg-white/40 origin-bottom" style={{ transform: `rotate(${deg}deg) translateY(2px)`, transformOrigin: 'center 68px' }} />
            ))}
       </div>
-
-      {/* Glass Glare */}
       <div className="absolute inset-0 rounded-full bg-gradient-to-br from-white/10 via-transparent to-black/40 pointer-events-none z-50" />
-
-      {/* Digital Readouts */}
       <div className="absolute bottom-3 inset-x-0 flex justify-between px-8 text-[7px] font-mono font-bold text-white/50 pointer-events-none z-40">
         <div className="flex flex-col items-center bg-black/60 px-1.5 py-0.5 rounded border border-white/5">
             <span className="text-[5px] uppercase tracking-wider text-white/40">Roll</span>
@@ -506,6 +591,7 @@ const RadarMapbox = memo(({
   lng,
   mode,
   accuracy,
+  zoom,
   onRecenter,
   onToggleMode
 }: { 
@@ -515,6 +601,7 @@ const RadarMapbox = memo(({
   lng: number,
   mode: MapMode,
   accuracy: number | null,
+  zoom: number,
   onRecenter: () => void,
   onToggleMode: () => void
 }) => {
@@ -527,7 +614,6 @@ const RadarMapbox = memo(({
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
     setIsOffCenter(distance > 30); 
-
     if (distance > MAP_UPDATE_THRESHOLD) {
       setAnchor({ lat, lng });
       setImgLoaded(false); 
@@ -537,21 +623,21 @@ const RadarMapbox = memo(({
 
   const styleId = mapStyle === 'satellite' ? 'satellite-streets-v12' : 'dark-v11';
   const currentMapUrl = useMemo(() => 
-    `https://api.mapbox.com/styles/v1/mapbox/${styleId}/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/600x600@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
-  [anchor.lat, anchor.lng, styleId]);
+    `https://api.mapbox.com/styles/v1/mapbox/${styleId}/static/${anchor.lng},${anchor.lat},${zoom},0,0/600x600@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
+  [anchor.lat, anchor.lng, styleId, zoom]);
 
   const { userX, userY, svgPath } = useMemo(() => {
-    const userPos = geoToPixels(lat, lng, anchor.lat, anchor.lng, RADAR_ZOOM);
+    const userPos = geoToPixels(lat, lng, anchor.lat, anchor.lng, zoom);
     let pathD = "";
     if (path.length > 1) {
       const points = path.map(p => {
-        const pt = geoToPixels(p.lat, p.lng, anchor.lat, anchor.lng, RADAR_ZOOM);
+        const pt = geoToPixels(p.lat, p.lng, anchor.lat, anchor.lng, zoom);
         return `${pt.x},${pt.y}`;
       });
       pathD = "M " + points.join(" L ");
     }
     return { userX: userPos.x, userY: userPos.y, svgPath: pathD };
-  }, [lat, lng, anchor, path]);
+  }, [lat, lng, anchor, path, zoom]);
 
   const rotation = mode === 'heading-up' ? heading : 0;
   const markerRotation = mode === 'heading-up' ? 0 : heading;
@@ -569,38 +655,18 @@ const RadarMapbox = memo(({
 
   return (
     <div className="relative w-64 h-64 md:w-72 md:h-72 shrink-0 select-none group flex flex-col items-center">
-      
-      {/* Main Container */}
       <div className="w-full h-full relative isolate rounded-full overflow-hidden border border-white/10 bg-black/80 shadow-2xl z-10">
-        
-        {/* Map Layer */}
-        <div 
-          className="absolute inset-0 rounded-full bg-black z-0"
-          style={{ maskImage: 'radial-gradient(white, black)', transform: 'translateZ(0)' }}
-        >
-          <div 
-            className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear origin-center"
-            style={{ transform: `rotate(${-rotation}deg) scale(1.02)` }} 
-          >
+        <div className="absolute inset-0 rounded-full bg-black z-0" style={{ maskImage: 'radial-gradient(white, black)', transform: 'translateZ(0)' }}>
+          <div className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear origin-center" style={{ transform: `rotate(${-rotation}deg) scale(1.02)` }}>
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[220%] h-[220%]">
                <div className="absolute inset-0 bg-[#0a0f0a]" />
                {!mapError && (
-                 <img
-                   src={currentMapUrl}
-                   alt="Map View"
-                   onLoad={() => setImgLoaded(true)}
-                   onError={() => setMapError(true)}
-                   className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
-                   style={{ filter: mapStyle === 'satellite' ? 'grayscale(0.3) contrast(1.1) brightness(0.9)' : 'contrast(1.2) brightness(0.8)' }}
-                 />
+                 <img src={currentMapUrl} alt="Map View" onLoad={() => setImgLoaded(true)} onError={() => setMapError(true)} className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`} style={{ filter: mapStyle === 'satellite' ? 'grayscale(0.3) contrast(1.1) brightness(0.9)' : 'contrast(1.2) brightness(0.8)' }} />
                )}
             </div>
-            
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
               <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
-                {svgPath && (
-                  <path d={svgPath} fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="opacity-60 drop-shadow-[0_0_8px_rgba(34,197,94,0.6)]" />
-                )}
+                {svgPath && <path d={svgPath} fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="opacity-60 drop-shadow-[0_0_8px_rgba(34,197,94,0.6)]" />}
                 <g transform={`translate(${userX}, ${userY})`}>
                    <g transform={`rotate(${markerRotation})`}>
                       <path d="M -6 -6 L 0 -18 L 6 -6" fill="rgba(34,197,94,0.9)" />
@@ -612,60 +678,35 @@ const RadarMapbox = memo(({
             </div>
           </div>
         </div>
-
-        {/* Range Rings Overlay */}
         <div className="absolute inset-0 rounded-full border border-white/5 pointer-events-none z-20">
             <div className="absolute inset-[25%] rounded-full border border-white/5" />
             <div className="absolute inset-[50%] rounded-full border border-white/5" />
         </div>
-
-        {/* Accuracy Ring */}
         <div className={`absolute inset-0 rounded-full border-[3px] ${accColor} pointer-events-none z-10 opacity-40`} />
-        
-        {/* Radar Sweep Animation */}
         <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden z-20">
              <div className="absolute inset-[-50%] bg-[conic-gradient(from_0deg,transparent_0deg,transparent_300deg,rgba(34,197,94,0.08)_360deg)] animate-[spin_4s_linear_infinite]" />
         </div>
-        
-        {/* HUD Crosshair */}
         <div className="absolute inset-0 pointer-events-none z-30 opacity-30">
            <div className="absolute top-1/2 left-0 w-full h-px bg-white/30" />
            <div className="absolute left-1/2 top-0 h-full w-px bg-white/30" />
            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-16 h-16 border border-white/20 rounded-full" />
         </div>
-
-        {/* North Indicator */}
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-none z-30"
-               style={{ transform: `rotate(${-rotation}deg)`, transformOrigin: 'center 110px' }}>
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-none z-30" style={{ transform: `rotate(${-rotation}deg)`, transformOrigin: 'center 110px' }}>
             <div className="text-[8px] font-black text-white bg-red-600 px-1 rounded-sm shadow-md">N</div>
         </div>
       </div>
-      
-      {/* External Controls (Connected) */}
       <div className="absolute -bottom-5 z-40 flex items-center gap-1 bg-[#111] p-1 rounded-full border border-white/10 shadow-xl backdrop-blur-md">
-            <button
-               onClick={() => { triggerHaptic(); onToggleMode(); }}
-               type="button"
-               className={`text-[9px] font-bold px-3 py-1.5 rounded-full border transition-all ${mode === 'heading-up' ? 'bg-green-500/20 text-green-500 border-green-500/20' : 'bg-transparent text-muted-foreground border-transparent hover:text-white'}`}
-            >
+            <button onClick={() => { triggerHaptic(); onToggleMode(); }} type="button" className={`text-[9px] font-bold px-3 py-1.5 rounded-full border transition-all ${mode === 'heading-up' ? 'bg-green-500/20 text-green-500 border-green-500/20' : 'bg-transparent text-muted-foreground border-transparent hover:text-white'}`}>
               {mode === 'heading-up' ? 'HDG' : 'NTH'}
             </button>
             <div className="w-px h-3 bg-white/10" />
-            <button
-               onClick={toggleStyle}
-               type="button"
-               className="p-1.5 rounded-full text-white/50 hover:text-white hover:bg-white/10 transition-colors"
-            >
+            <button onClick={toggleStyle} type="button" className="p-1.5 rounded-full text-white/50 hover:text-white hover:bg-white/10 transition-colors">
               <Layers className="w-3.5 h-3.5" />
             </button>
              {isOffCenter && (
                  <>
                     <div className="w-px h-3 bg-white/10" />
-                    <button 
-                    onClick={() => { triggerHaptic(); onRecenter(); }}
-                    type="button"
-                    className="p-1.5 rounded-full text-blue-400 hover:bg-blue-500/10 transition-colors"
-                    >
+                    <button onClick={() => { triggerHaptic(); onRecenter(); }} type="button" className="p-1.5 rounded-full text-blue-400 hover:bg-blue-500/10 transition-colors">
                     <Crosshair className="w-3.5 h-3.5" />
                     </button>
                 </>
@@ -720,30 +761,18 @@ const CompassDisplay = memo(({
         role="button"
         aria-label="Calibrate Compass"
       >
-        {/* Fixed Outer Bezel */}
         <div className="absolute inset-0 rounded-full border-[10px] border-[#0c0c0c] bg-[#111] shadow-2xl flex items-center justify-center ring-1 ring-white/10">
-             
-             {/* Cardinal Markers on Bezel */}
              <div className="absolute top-1 text-[10px] font-black text-red-500">N</div>
              <div className="absolute right-2 text-[10px] font-black text-white/30">E</div>
              <div className="absolute bottom-2 text-[10px] font-black text-white/30">S</div>
              <div className="absolute left-2 text-[10px] font-black text-white/30">W</div>
-             
-             {/* North Triangle Indicator */}
              <div className="absolute top-0 -translate-y-1 w-0 h-0 border-l-[8px] border-l-transparent border-r-[8px] border-r-transparent border-t-[10px] border-t-red-600 drop-shadow-[0_4px_4px_rgba(0,0,0,0.5)] z-20" />
         </div>
-        
-        {/* Rotating Dial */}
-        <div 
-          className="absolute inset-4 will-change-transform transition-transform duration-100 ease-linear rounded-full bg-[radial-gradient(circle,rgba(30,30,30,1)_0%,rgba(10,10,10,1)_100%)] border border-white/5"
-          style={{ transform: `rotate(${-rotation}deg)` }}
-        >
+        <div className="absolute inset-4 will-change-transform transition-transform duration-100 ease-linear rounded-full bg-[radial-gradient(circle,rgba(30,30,30,1)_0%,rgba(10,10,10,1)_100%)] border border-white/5" style={{ transform: `rotate(${-rotation}deg)` }}>
           <svg viewBox="0 0 100 100" className="w-full h-full select-none pointer-events-none p-1">
             <CompassTicks />
           </svg>
         </div>
-
-        {/* Center HUD Data */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center z-20 pointer-events-none">
              <span className="text-5xl font-mono font-black tracking-tighter text-white tabular-nums drop-shadow-lg">
                 {permissionGranted || source === 'GPS' ? `${displayHeading}°` : "--"}
@@ -757,8 +786,6 @@ const CompassDisplay = memo(({
                  </span>
              </div>
         </div>
-        
-        {/* Alignment Prompt */}
         {!permissionGranted && !hasError && source === 'MAG' && (
           <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-black/60 backdrop-blur-sm">
             <button type="button" className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-white animate-pulse bg-blue-600/20 px-4 py-2 rounded-full border border-blue-500/50 shadow-xl hover:bg-blue-600/30 transition-colors">
@@ -766,7 +793,6 @@ const CompassDisplay = memo(({
             </button>
           </div>
         )}
-        
         {hasError && (
           <div className="absolute inset-0 flex items-center justify-center z-30 bg-background/50 backdrop-blur-sm rounded-full">
             <WifiOff className="w-8 h-8 text-destructive/80" />
@@ -780,7 +806,6 @@ CompassDisplay.displayName = "CompassDisplay";
 
 const DataCard = memo(({ children, className }: { children: React.ReactNode, className?: string }) => (
     <div className={`relative p-4 rounded-xl bg-[#111]/60 border border-white/5 backdrop-blur-md overflow-hidden ${className}`}>
-        {/* Tactical Corner Accents */}
         <div className="absolute top-0 left-0 w-2 h-2 border-l border-t border-white/20" />
         <div className="absolute top-0 right-0 w-2 h-2 border-r border-t border-white/20" />
         <div className="absolute bottom-0 left-0 w-2 h-2 border-l border-b border-white/20" />
@@ -838,7 +863,6 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
     const nightLength = riseTomorrow - setToday;
     progress = ((now - setToday) / nightLength) * 100;
   }
-
   progress = Math.min(Math.max(progress, 0), 100);
 
   return (
@@ -853,10 +877,7 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
          </span>
       </div>
       <div className="relative w-full h-1.5 bg-black/60 rounded-full overflow-hidden border border-white/5">
-         <div 
-            className={`absolute top-0 bottom-0 left-0 shadow-[0_0_8px_rgba(255,255,255,0.4)] ${isDay ? 'bg-amber-500' : 'bg-blue-500'}`} 
-            style={{ width: `${progress}%`, transition: 'width 1s linear' }}
-         />
+         <div className={`absolute top-0 bottom-0 left-0 shadow-[0_0_8px_rgba(255,255,255,0.4)] ${isDay ? 'bg-amber-500' : 'bg-blue-500'}`} style={{ width: `${progress}%`, transition: 'width 1s linear' }} />
       </div>
       <div className="flex justify-between text-[8px] font-mono text-muted-foreground uppercase">
          <div className="flex items-center gap-1"><Sunrise className="w-3 h-3" /> {formatTime(sunrise[0])}</div>
@@ -867,18 +888,9 @@ const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string
 });
 SolarCard.displayName = "SolarCard";
 
-const CoordinateRow = memo(({ 
-  label, 
-  value, 
-  type 
-}: { 
-  label: string; 
-  value: number; 
-  type: 'lat' | 'lng' 
-}) => {
+const CoordinateRow = memo(({ label, value, type }: { label: string; value: number; type: 'lat' | 'lng' }) => {
   const formattedValue = useMemo(() => formatCoordinate(value, type), [value, type]);
   const [copied, setCopied] = useState(false);
-  
   const handleCopy = async () => {
     triggerHaptic();
     if (!navigator.clipboard) return;
@@ -890,18 +902,10 @@ const CoordinateRow = memo(({
   };
   
   return (
-    <button 
-      className="group w-full flex items-center justify-between px-3 py-2.5 rounded-lg bg-black/20 hover:bg-white/5 border border-transparent hover:border-white/5 active:scale-[0.99] transition-all touch-manipulation" 
-      onClick={handleCopy}
-      type="button"
-    >
+    <button className="group w-full flex items-center justify-between px-3 py-2.5 rounded-lg bg-black/20 hover:bg-white/5 border border-transparent hover:border-white/5 active:scale-[0.99] transition-all touch-manipulation" onClick={handleCopy} type="button">
       <div className="flex flex-col items-start">
-         <span className={`text-[8px] uppercase tracking-widest font-bold transition-colors ${copied ? "text-green-500" : "text-muted-foreground"}`}>
-           {copied ? "COPIED" : label}
-         </span>
-         <span className="text-lg font-mono font-medium tracking-tight text-foreground tabular-nums mt-0.5">
-           {formattedValue}
-         </span>
+         <span className={`text-[8px] uppercase tracking-widest font-bold transition-colors ${copied ? "text-green-500" : "text-muted-foreground"}`}>{copied ? "COPIED" : label}</span>
+         <span className="text-lg font-mono font-medium tracking-tight text-foreground tabular-nums mt-0.5">{formattedValue}</span>
       </div>
       <div className={`p-1.5 rounded-md transition-colors ${copied ? "bg-green-500/10 text-green-500" : "bg-transparent text-muted-foreground/30 group-hover:text-foreground"}`}>
           {copied ? <div className="w-1.5 h-1.5 rounded-full bg-green-500" /> : <Maximize2 className="w-3 h-3" />}
@@ -911,18 +915,7 @@ const CoordinateRow = memo(({
 });
 CoordinateRow.displayName = "CoordinateRow";
 
-// --- FULL MAP DRAWER ---
-const FullMapDrawer = memo(({ 
-  isOpen, 
-  onClose, 
-  lat, 
-  lng 
-}: { 
-  isOpen: boolean, 
-  onClose: () => void, 
-  lat: number, 
-  lng: number 
-}) => {
+const FullMapDrawer = memo(({ isOpen, onClose, lat, lng }: { isOpen: boolean, onClose: () => void, lat: number, lng: number }) => {
   const [copied, setCopied] = useState(false);
   const mapContainer = useRef<HTMLDivElement>(null);
   const map = useRef<mapboxgl.Map | null>(null);
@@ -930,8 +923,7 @@ const FullMapDrawer = memo(({
   const [zoomLevel, setZoomLevel] = useState(16);
 
   useEffect(() => {
-    if (!isOpen || !mapContainer.current) return;
-    if (map.current) return; 
+    if (!isOpen || !mapContainer.current || map.current) return; 
 
     try {
       map.current = new mapboxgl.Map({
@@ -941,63 +933,30 @@ const FullMapDrawer = memo(({
         zoom: 16,
         attributionControl: false
       });
-
       map.current.addControl(new mapboxgl.AttributionControl({ compact: true }), 'bottom-right');
-
       const el = document.createElement('div');
       el.className = 'marker';
-      el.innerHTML = `
-        <div style="position: relative; width: 20px; height: 20px; display: flex; justify-content: center; align-items: center;">
-          <div style="position: absolute; width: 100%; height: 100%; border-radius: 50%; background-color: rgba(34, 197, 94, 0.5); animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>
-          <div style="width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 10px rgba(34,197,94,0.8);"></div>
-        </div>
-        <style>
-          @keyframes ping {
-            75%, 100% { transform: scale(2); opacity: 0; }
-          }
-        </style>
-      `;
-
-      marker.current = new mapboxgl.Marker({ element: el })
-        .setLngLat([lng, lat])
-        .addTo(map.current);
-
-      map.current.on('zoom', () => {
-        if(map.current) setZoomLevel(map.current.getZoom());
-      });
-    } catch (e) {
-      console.error("Map initialization failed", e);
-    }
+      el.innerHTML = `<div style="position: relative; width: 20px; height: 20px; display: flex; justify-content: center; align-items: center;"><div style="position: absolute; width: 100%; height: 100%; border-radius: 50%; background-color: rgba(34, 197, 94, 0.5); animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div><div style="width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 10px rgba(34,197,94,0.8);"></div></div>`;
+      marker.current = new mapboxgl.Marker({ element: el }).setLngLat([lng, lat]).addTo(map.current);
+      map.current.on('zoom', () => { if(map.current) setZoomLevel(map.current.getZoom()); });
+    } catch (e) { console.error("Map initialization failed", e); }
   }, [isOpen]);
 
   useEffect(() => {
-    return () => {
-      if (map.current) {
-        map.current.remove();
-        map.current = null;
-      }
-    };
+    return () => { if (map.current) { map.current.remove(); map.current = null; } };
   }, []);
 
   useEffect(() => {
     if (!map.current) return;
-    
     if (marker.current) marker.current.setLngLat([lng, lat]);
-
     const currentCenter = map.current.getCenter();
     const dist = getDistance(currentCenter.lat, currentCenter.lng, lat, lng);
-    
-    if (dist > 100) {
-       map.current.flyTo({ center: [lng, lat], speed: 0.8 });
-    }
+    if (dist > 100) map.current.flyTo({ center: [lng, lat], speed: 0.8 });
   }, [lat, lng]);
 
   useEffect(() => {
     if (isOpen && map.current) {
-      setTimeout(() => {
-        map.current?.resize();
-        map.current?.flyTo({ center: [lng, lat] });
-      }, 300); 
+      setTimeout(() => { map.current?.resize(); map.current?.flyTo({ center: [lng, lat] }); }, 300); 
     }
   }, [isOpen]);
 
@@ -1009,63 +968,38 @@ const FullMapDrawer = memo(({
        triggerHaptic();
     }
   };
-
   const zoomIn = () => { triggerHaptic(); map.current?.zoomIn(); };
   const zoomOut = () => { triggerHaptic(); map.current?.zoomOut(); };
-  const resetView = () => { 
-    triggerHaptic(); 
-    map.current?.flyTo({ center: [lng, lat], zoom: 16, bearing: 0, pitch: 0 }); 
-  };
+  const resetView = () => { triggerHaptic(); map.current?.flyTo({ center: [lng, lat], zoom: 16, bearing: 0, pitch: 0 }); };
 
   return (
     <>
       <div className={`fixed inset-0 bg-black/90 backdrop-blur-sm z-[60] transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} onClick={onClose} />
-      
       <div className={`fixed bottom-0 left-0 right-0 h-[92dvh] bg-[#0c0c0c] border-t border-white/10 rounded-t-[2rem] shadow-2xl z-[61] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) flex flex-col ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
-        
         <div className="absolute top-0 left-0 right-0 z-[65] p-6 pt-8 flex justify-between items-start pointer-events-none bg-gradient-to-b from-black/80 to-transparent">
             <div className="pointer-events-auto space-y-1">
                 <div className="flex items-center gap-2">
                     <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse shadow-[0_0_10px_#22c55e]" />
                     <h3 className="text-xl font-black text-white tracking-widest uppercase font-mono">Sat<span className="text-white/40">.Link</span></h3>
                 </div>
-                <button 
-                  onClick={handleCopy}
-                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 active:scale-95 transition-all group"
-                >
-                    <span className={`text-[10px] font-mono tracking-wider ${copied ? 'text-green-400' : 'text-white/60 group-hover:text-white'}`}>
-                        {lat.toFixed(6)}, {lng.toFixed(6)}
-                    </span>
+                <button onClick={handleCopy} className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 active:scale-95 transition-all group">
+                    <span className={`text-[10px] font-mono tracking-wider ${copied ? 'text-green-400' : 'text-white/60 group-hover:text-white'}`}>{lat.toFixed(6)}, {lng.toFixed(6)}</span>
                     {copied ? <Check className="w-3 h-3 text-green-400"/> : <Copy className="w-3 h-3 text-white/40 group-hover:text-white"/>}
                 </button>
             </div>
-            
-            <button onClick={onClose} className="pointer-events-auto p-3 rounded-full bg-white/5 border border-white/10 text-white hover:bg-white/10 active:scale-90 transition-all backdrop-blur-md">
-                <X className="w-5 h-5" />
-            </button>
+            <button onClick={onClose} className="pointer-events-auto p-3 rounded-full bg-white/5 border border-white/10 text-white hover:bg-white/10 active:scale-90 transition-all backdrop-blur-md"><X className="w-5 h-5" /></button>
         </div>
-
-        <div 
-           className="relative flex-1 w-full h-full overflow-hidden bg-[#111] touch-none"
-           ref={mapContainer}
-        >
-           <div className="absolute inset-0 flex items-center justify-center -z-10">
-               <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
-           </div>
-
-           <div className="absolute inset-0 pointer-events-none z-10 opacity-[0.05]" 
-                style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }} 
-           />
+        <div className="relative flex-1 w-full h-full overflow-hidden bg-[#111]" ref={mapContainer}>
+           <div className="absolute inset-0 flex items-center justify-center -z-10"><Loader2 className="w-8 h-8 animate-spin text-green-500/50" /></div>
+           <div className="absolute inset-0 pointer-events-none z-10 opacity-[0.05]" style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }} />
         </div>
-
-        <div className="absolute right-4 top-1/2 -translate-y-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
+        <div className="absolute right-4 top-1/2 -translate-x-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
              <div className="pointer-events-auto flex flex-col gap-2 bg-black/40 backdrop-blur-md p-1.5 rounded-2xl border border-white/10">
                  <button onClick={zoomIn} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Plus className="w-5 h-5"/></button>
                  <button onClick={resetView} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors text-[10px] font-bold font-mono">{Math.round(zoomLevel)}z</button>
                  <button onClick={zoomOut} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Minus className="w-5 h-5"/></button>
              </div>
         </div>
-
         <div className="absolute bottom-0 left-0 right-0 z-[65] p-6 bg-gradient-to-t from-black via-black/90 to-transparent">
              <div className="grid grid-cols-2 gap-3 max-w-lg mx-auto">
                  <button onClick={() => window.open(`http://maps.apple.com/?ll=${lat},${lng}&q=${lat},${lng}`, '_blank')} className="flex items-center justify-center gap-2 py-4 rounded-xl bg-white/10 hover:bg-white/20 border border-white/10 text-white font-bold text-xs uppercase tracking-wider backdrop-blur-md transition-all active:scale-[0.98]">
@@ -1099,6 +1033,7 @@ export default function GeoLocation() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordedPath, setRecordedPath] = useState<GeoPoint[]>([]);
   const [showSaveButton, setShowSaveButton] = useState(false);
+  const [isGestureMode, setIsGestureMode] = useState(false);
   
   const isMountedRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -1110,13 +1045,8 @@ export default function GeoLocation() {
   }, []);
 
   const isMoving = (coords?.speed ?? 0) > GPS_HEADING_THRESHOLD;
-  const effectiveHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined
-    ? coords.heading
-    : (heading ?? 0);
-  
-  const effectiveTrueHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined
-    ? coords.heading
-    : trueHeading;
+  const effectiveHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined ? coords.heading : (heading ?? 0);
+  const effectiveTrueHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined ? coords.heading : trueHeading;
 
   useEffect(() => {
     if (!coords) return;
@@ -1245,7 +1175,6 @@ export default function GeoLocation() {
   }, [debouncedCoords, lastApiFetch, address, weather]);
 
   const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
-  
   const recordedDistance = useMemo(() => {
      if (!isRecording && recordedPath.length === 0) return 0;
      const dist = calculateTotalDistance(recordedPath);
@@ -1261,7 +1190,6 @@ export default function GeoLocation() {
           <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:40px_40px] opacity-20" />
       </div>
 
-      {/* Header */}
       <div className="w-full max-w-5xl flex justify-between items-center z-40 mb-8 shrink-0">
          <div className="flex flex-col">
              <div className="flex items-center gap-2">
@@ -1283,20 +1211,17 @@ export default function GeoLocation() {
                  </span>
                </div>
             )}
-            <button
-               onClick={toggleRecording}
-               className={`group flex items-center gap-2 px-4 py-2 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all active:scale-95 ${
-                 isRecording ? "bg-red-500/10 border-red-500/50 text-red-500 shadow-[0_0_10px_rgba(239,68,68,0.2)]" : "bg-white/5 border-white/10 text-muted-foreground hover:bg-white/10 hover:text-white"
-               }`}
-            >
+            <button onClick={toggleRecording} className={`group flex items-center gap-2 px-4 py-2 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all active:scale-95 ${isRecording ? "bg-red-500/10 border-red-500/50 text-red-500 shadow-[0_0_10px_rgba(239,68,68,0.2)]" : "bg-white/5 border-white/10 text-muted-foreground hover:bg-white/10 hover:text-white"}`}>
                {isRecording ? <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> : <Circle className="w-2 h-2 group-hover:text-white transition-colors" />}
                {isRecording ? "REC" : "LOG"}
             </button>
-            <button onClick={toggleUnits} className="px-3 py-2 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-bold uppercase tracking-wider text-muted-foreground hover:text-white transition-all active:scale-95">
-               {units === 'metric' ? 'MET' : 'IMP'}
+            <button onClick={() => setIsGestureMode(!isGestureMode)} className={`p-2 rounded-full border text-[10px] transition-all active:scale-95 ${isGestureMode ? "bg-green-500/10 border-green-500/50 text-green-500" : "bg-white/5 border-white/10 text-muted-foreground hover:text-white"}`}>
+               {isGestureMode ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
             </button>
          </div>
       </div>
+
+      {isGestureMode && <GestureOps onToggleRecording={toggleRecording} onToggleMapMode={toggleMapMode} isRecording={isRecording} />}
 
       <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 z-10">
         {loading && !coords && (
@@ -1324,8 +1249,6 @@ export default function GeoLocation() {
 
         {coords && (
           <div className="w-full grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 animate-in fade-in slide-in-from-bottom-8 duration-700">
-             
-             {/* Left Column: Stats */}
              <div className="lg:col-span-4 flex flex-col gap-4 order-2 lg:order-1">
                  <DataCard className="space-y-4">
                     <div className="flex items-center justify-between">
@@ -1377,15 +1300,9 @@ export default function GeoLocation() {
                  )}
              </div>
 
-             {/* Center Column: HUD Visuals (Main Avionics Stack) */}
              <div className="lg:col-span-8 flex flex-col items-center justify-center order-1 lg:order-2">
-                 {/* Stack Container */}
                  <div className="relative w-full flex flex-col items-center justify-center py-6 gap-6 md:gap-8">
-                     
-                     {/* The Spine (Connecting Line) */}
                      <div className="absolute inset-y-0 left-1/2 w-px bg-gradient-to-b from-transparent via-white/10 to-transparent -z-10" />
-
-                     {/* 1. Compass (Top) */}
                      <CompassDisplay 
                         heading={effectiveHeading} 
                         trueHeading={effectiveTrueHeading} 
@@ -1394,19 +1311,11 @@ export default function GeoLocation() {
                         permissionGranted={permissionGranted}
                         source={isMoving ? 'GPS' : 'MAG'}
                      />
-
-                     {/* 2. Gyro (Middle - Hub) */}
                      <div className="relative z-10">
-                         {/* Connection to Top */}
                          <div className="absolute -top-8 left-1/2 -translate-x-1/2 w-px h-8 bg-gradient-to-b from-white/10 to-white/30" />
-                         
                          <Inclinometer pitch={pitch} roll={roll} />
-                         
-                         {/* Connection to Bottom */}
                          <div className="absolute -bottom-8 left-1/2 -translate-x-1/2 w-px h-8 bg-gradient-to-t from-white/10 to-white/30" />
                      </div>
-
-                     {/* 3. Map (Bottom) */}
                      <div className="flex flex-col items-center gap-4 relative z-10 mt-2">
                         <RadarMapbox 
                           path={path} 
@@ -1415,6 +1324,7 @@ export default function GeoLocation() {
                           heading={effectiveHeading || 0}
                           mode={mapMode}
                           accuracy={coords.accuracy}
+                          zoom={RADAR_ZOOM}
                           onRecenter={recenterMap}
                           onToggleMode={toggleMapMode}
                         />
@@ -1429,10 +1339,7 @@ export default function GeoLocation() {
           </div>
         )}
       </div>
-
-      {coords && (
-        <FullMapDrawer isOpen={isMapDrawerOpen} onClose={() => setIsMapDrawerOpen(false)} lat={coords.latitude} lng={coords.longitude} />
-      )}
+      {coords && <FullMapDrawer isOpen={isMapDrawerOpen} onClose={() => setIsMapDrawerOpen(false)} lat={coords.latitude} lng={coords.longitude} />}
     </main>
   );
 }
