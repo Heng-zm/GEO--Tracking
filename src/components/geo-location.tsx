@@ -7,7 +7,7 @@ import {
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
   Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan,
-  ArrowUp, Hand, Video, VideoOff, Eye
+  ArrowUp, Hand, Video, VideoOff, Eye, Zap
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -25,7 +25,7 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 mapboxgl.accessToken = MAPBOX_TOKEN;
 
-const RADAR_ZOOM = 18; // <--- Restored this constant
+const RADAR_ZOOM = 18;
 const TRAIL_MAX_POINTS = 100; 
 const TRAIL_MIN_DISTANCE = 5; 
 const MAP_UPDATE_THRESHOLD = 80; 
@@ -190,9 +190,7 @@ const useWakeLock = () => {
       if ('wakeLock' in navigator && document.visibilityState === 'visible') {
         wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
       }
-    } catch (err) {
-      console.warn('Wake Lock request failed:', err);
-    }
+    } catch (err) {}
   }, []);
 
   const releaseLock = useCallback(async () => {
@@ -200,9 +198,7 @@ const useWakeLock = () => {
       try {
         await wakeLockRef.current.release();
         wakeLockRef.current = null;
-      } catch (err) {
-        console.warn('Wake Lock release failed:', err);
-      }
+      } catch (err) {}
     }
   }, []);
 
@@ -223,6 +219,7 @@ const useWakeLock = () => {
 const useGeolocation = () => {
   const [state, setState] = useState<GeoState>({ coords: null, error: null, loading: true });
   const lastUpdate = useRef<number>(0);
+  const watchId = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !navigator.geolocation) {
@@ -230,53 +227,45 @@ const useGeolocation = () => {
       return;
     }
 
-    const handleSuccess = ({ coords }: GeolocationPosition) => {
-      const now = Date.now();
-      // Throttle updates slightly to reduce render churn
-      if (now - lastUpdate.current < 200) return;
-      if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
-      lastUpdate.current = now;
+    const startWatching = () => {
+      watchId.current = navigator.geolocation.watchPosition(
+        ({ coords }: GeolocationPosition) => {
+          const now = Date.now();
+          if (now - lastUpdate.current < 500) return; // Throttle 500ms
+          if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
+          lastUpdate.current = now;
 
-      setState(prev => {
-        if (prev.coords && 
-            prev.coords.latitude === coords.latitude && 
-            prev.coords.longitude === coords.longitude &&
-            prev.coords.heading === coords.heading &&
-            prev.coords.speed === coords.speed &&
-            prev.coords.accuracy === coords.accuracy) {
-          return prev;
-        }
-        return {
-          coords: {
-            latitude: coords.latitude,
-            longitude: coords.longitude,
-            accuracy: coords.accuracy,
-            altitude: coords.altitude,
-            speed: coords.speed,
-            heading: coords.heading,
-          }, 
-          error: null, 
-          loading: false,
-        };
-      });
+          setState(prev => {
+            if (prev.coords && 
+                prev.coords.latitude === coords.latitude && 
+                prev.coords.longitude === coords.longitude &&
+                Math.abs((prev.coords.heading || 0) - (coords.heading || 0)) < 1) {
+              return prev;
+            }
+            return {
+              coords: {
+                latitude: coords.latitude,
+                longitude: coords.longitude,
+                accuracy: coords.accuracy,
+                altitude: coords.altitude,
+                speed: coords.speed,
+                heading: coords.heading,
+              }, 
+              error: null, 
+              loading: false,
+            };
+          });
+        }, 
+        (error) => {
+          if (error.code === error.TIMEOUT) return; 
+          setState(s => ({ ...s, loading: false, error: "Signal Lost" }));
+        }, 
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 1000 }
+      );
     };
 
-    const handleError = (error: GeolocationPositionError) => {
-      let errorMessage = "Signal Lost";
-      switch(error.code) {
-        case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
-        case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return;
-      }
-      setState(s => ({ ...s, loading: false, error: errorMessage }));
-    };
-
-    const watcher = navigator.geolocation.watchPosition(
-      handleSuccess, handleError, 
-      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
-    );
-
-    return () => navigator.geolocation.clearWatch(watcher);
+    startWatching();
+    return () => { if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current); };
   }, []);
 
   return state;
@@ -306,12 +295,13 @@ const useCompass = () => {
   
   useEffect(() => {
     if (!permissionGranted) return;
+    
     const loop = () => {
       if (!isRunningRef.current) return;
       
       const hDiff = targetHeadingRef.current - currentHeadingRef.current;
       if (Math.abs(hDiff) > 0.1) {
-          currentHeadingRef.current += hDiff * 0.1;
+          currentHeadingRef.current += hDiff * 0.15;
           setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
       } else if (currentHeadingRef.current !== targetHeadingRef.current) {
           currentHeadingRef.current = targetHeadingRef.current;
@@ -389,7 +379,7 @@ const useDebounce = <T,>(value: T, delay: number): T => {
   return debouncedValue;
 };
 
-// --- GESTURE COMPONENT ---
+// --- OPTIMIZED GESTURE COMPONENT ---
 const GestureOps = memo(({ 
   onToggleRecording, 
   onToggleMapMode,
@@ -404,119 +394,166 @@ const GestureOps = memo(({
   const [loading, setLoading] = useState(true);
   const [gestureState, setGestureState] = useState<'neutral' | 'pinch' | 'fist'>('neutral');
   const [debugMsg, setDebugMsg] = useState("Initializing AI...");
+  const isMountedRef = useRef(true);
 
-  // Load Handpose Model
+  // Performance Optimization: Run TF.js configuration once
   useEffect(() => {
-    const loadModel = async () => {
+    isMountedRef.current = true;
+    const initTF = async () => {
       try {
+        await tf.ready();
+        // Force WebGL backend
         await tf.setBackend('webgl');
+        // Optimize WebGL flags for mobile garbage collection
+        tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
+        
         const net = await handpose.load();
-        setModel(net);
-        setLoading(false);
-        setDebugMsg("Ops Ready");
+        if (isMountedRef.current) {
+          setModel(net);
+          setLoading(false);
+          setDebugMsg("AI Ready");
+        }
       } catch (e) {
         console.error("AI Load Failed", e);
-        setDebugMsg("AI Error");
+        if (isMountedRef.current) setDebugMsg("AI Error");
       }
     };
-    loadModel();
+    initTF();
+    return () => { isMountedRef.current = false; };
   }, []);
 
-  // Detection Loop
+  // Performance Optimization: Detection Loop
   useEffect(() => {
     if (!model) return;
 
     let rafId: number;
+    let timeoutId: NodeJS.Timeout;
     let lastActionTime = 0;
-    const COOLDOWN = 1000; // ms between actions
+    
+    // Confidence counters to prevent accidental triggers
+    let consecutivePinchFrames = 0;
+    let consecutiveFistFrames = 0;
+    const FRAMES_TO_TRIGGER = 3; 
+    const ACTION_COOLDOWN = 1200; 
+    
+    // THROTTLE: Only run detection every ~150ms (approx 6-7 FPS) to save battery
+    const DETECTION_INTERVAL = 150; 
 
-    const detect = async () => {
+    const loop = async () => {
+      if (!isMountedRef.current) return;
+
       if (
-        typeof webcamRef.current !== "undefined" &&
-        webcamRef.current !== null &&
-        webcamRef.current.video?.readyState === 4
+        webcamRef.current &&
+        webcamRef.current.video &&
+        webcamRef.current.video.readyState === 4
       ) {
         const video = webcamRef.current.video;
+        
+        // Use tf.tidy to automatically clean up intermediate tensors
         const hands = await model.estimateHands(video);
 
-        if (hands.length > 0) {
-          const landmarks = hands[0].landmarks;
+        if (isMountedRef.current) {
+          if (hands.length > 0) {
+            const landmarks = hands[0].landmarks;
 
-          // 1. PINCH DETECTION (Thumb tip to Index tip)
-          const thumbTip = landmarks[4];
-          const indexTip = landmarks[8];
-          const pinkyTip = landmarks[20];
-          // const palmBase = landmarks[0];
+            // 1. PINCH (Thumb tip to Index tip)
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const pinchDist = Math.sqrt(
+              Math.pow(thumbTip[0] - indexTip[0], 2) +
+              Math.pow(thumbTip[1] - indexTip[1], 2)
+            );
 
-          const pinchDist = Math.sqrt(
-            Math.pow(thumbTip[0] - indexTip[0], 2) +
-            Math.pow(thumbTip[1] - indexTip[1], 2)
-          );
+            // 2. FIST (Thumb tip to Pinky tip)
+            const pinkyTip = landmarks[20];
+            const fistDist = Math.sqrt(
+              Math.pow(thumbTip[0] - pinkyTip[0], 2) +
+              Math.pow(thumbTip[1] - pinkyTip[1], 2)
+            );
 
-          // 2. FIST DETECTION (Fingertips close to palm base or simply thumb close to pinky)
-          // Simplified: Thumb tip close to Pinky tip implies closed hand
-          const fistDist = Math.sqrt(
-            Math.pow(thumbTip[0] - pinkyTip[0], 2) +
-            Math.pow(thumbTip[1] - pinkyTip[1], 2)
-          );
+            const now = Date.now();
 
-          const now = Date.now();
+            // Check distances (thresholds calibrated for 160px width)
+            if (pinchDist < 25) {
+              consecutivePinchFrames++;
+              consecutiveFistFrames = 0;
+              setGestureState('pinch');
 
-          // Thresholds depend on camera distance, roughly calibrated here
-          if (pinchDist < 30) {
-            setGestureState('pinch');
-            if (now - lastActionTime > COOLDOWN) {
-              triggerHaptic();
-              onToggleMapMode();
-              setDebugMsg("Map Mode Toggled");
-              lastActionTime = now;
-            }
-          } else if (fistDist < 30) {
-            setGestureState('fist');
-            if (now - lastActionTime > COOLDOWN) {
-              triggerHaptic();
-              onToggleRecording();
-              setDebugMsg(isRecording ? "Rec Stopped" : "Rec Started");
-              lastActionTime = now;
+              if (consecutivePinchFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
+                triggerHaptic();
+                onToggleMapMode();
+                setDebugMsg("Map Toggled");
+                lastActionTime = now;
+                consecutivePinchFrames = 0;
+              }
+            } else if (fistDist < 30) {
+              consecutiveFistFrames++;
+              consecutivePinchFrames = 0;
+              setGestureState('fist');
+
+              if (consecutiveFistFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
+                triggerHaptic();
+                onToggleRecording();
+                setDebugMsg(isRecording ? "Rec Stopped" : "Rec Started");
+                lastActionTime = now;
+                consecutiveFistFrames = 0;
+              }
+            } else {
+              consecutivePinchFrames = 0;
+              consecutiveFistFrames = 0;
+              setGestureState('neutral');
+              setDebugMsg("Scanning...");
             }
           } else {
             setGestureState('neutral');
-            setDebugMsg("Scanning...");
           }
-        } else {
-          setGestureState('neutral');
         }
       }
-      rafId = requestAnimationFrame(detect);
+      
+      // Throttle the loop
+      timeoutId = setTimeout(() => {
+        rafId = requestAnimationFrame(loop);
+      }, DETECTION_INTERVAL);
     };
 
-    detect();
-    return () => cancelAnimationFrame(rafId);
+    loop();
+
+    return () => { 
+      cancelAnimationFrame(rafId);
+      clearTimeout(timeoutId);
+    };
   }, [model, onToggleRecording, onToggleMapMode, isRecording]);
 
   return (
-    <div className="absolute top-20 right-4 w-28 h-36 bg-black/80 rounded-xl border border-green-500/30 overflow-hidden z-50 shadow-2xl backdrop-blur-md">
+    <div className="absolute top-20 right-4 w-28 h-36 bg-black/90 rounded-xl border border-green-500/30 overflow-hidden z-50 shadow-2xl backdrop-blur-md transition-all animate-in fade-in zoom-in duration-300">
        <Webcam
           ref={webcamRef}
-          className="absolute inset-0 w-full h-full object-cover opacity-60 grayscale"
+          className="absolute inset-0 w-full h-full object-cover opacity-50 grayscale"
           mirrored={true}
-          videoConstraints={{ width: 200, height: 200, facingMode: "user" }}
+          // OPTIMIZATION: Ultra-low resolution for faster processing
+          videoConstraints={{ width: 160, height: 120, facingMode: "user" }}
+          screenshotFormat="image/jpeg"
        />
        
        <div className="absolute inset-0 flex flex-col items-center justify-between p-2 pointer-events-none">
           {loading ? (
-            <Loader2 className="w-6 h-6 animate-spin text-green-500 mt-8" />
+            <div className="flex flex-col items-center justify-center h-full gap-2">
+                <Loader2 className="w-6 h-6 animate-spin text-green-500" />
+                <span className="text-[8px] font-mono text-green-500/80 animate-pulse">BOOTING AI</span>
+            </div>
           ) : (
-             <div className="mt-8">
-               {gestureState === 'neutral' && <Hand className="w-8 h-8 text-white/50" />}
-               {gestureState === 'pinch' && <Scan className="w-8 h-8 text-green-400 animate-pulse" />}
-               {gestureState === 'fist' && <Circle className="w-8 h-8 text-red-400 fill-red-400 animate-pulse" />}
+             <div className="mt-8 transition-all duration-200">
+               {gestureState === 'neutral' && <Hand className="w-8 h-8 text-white/40" />}
+               {gestureState === 'pinch' && <Scan className="w-8 h-8 text-green-400 animate-pulse drop-shadow-[0_0_8px_rgba(74,222,128,0.8)]" />}
+               {gestureState === 'fist' && <Circle className="w-8 h-8 text-red-500 fill-red-500/50 animate-pulse drop-shadow-[0_0_8px_rgba(239,68,68,0.8)]" />}
              </div>
           )}
           
-          <div className="w-full bg-black/60 backdrop-blur-sm rounded text-[8px] font-mono text-center py-1 text-green-400 border-t border-green-500/20">
-             {debugMsg}
-          </div>
+          {!loading && (
+            <div className="w-full bg-black/80 backdrop-blur-md rounded text-[8px] font-mono text-center py-1 text-green-400 border-t border-green-500/20">
+                {debugMsg}
+            </div>
+          )}
        </div>
 
        {/* Corner Accents */}
@@ -524,6 +561,11 @@ const GestureOps = memo(({
        <div className="absolute top-0 right-0 w-2 h-2 border-r border-t border-green-500/50" />
        <div className="absolute bottom-0 left-0 w-2 h-2 border-l border-b border-green-500/50" />
        <div className="absolute bottom-0 right-0 w-2 h-2 border-r border-b border-green-500/50" />
+       
+       {/* Active Indicator */}
+       <div className="absolute top-1 right-1">
+           <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse shadow-[0_0_5px_#22c55e]" />
+       </div>
     </div>
   );
 });
@@ -1214,6 +1256,9 @@ export default function GeoLocation() {
             <button onClick={toggleRecording} className={`group flex items-center gap-2 px-4 py-2 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all active:scale-95 ${isRecording ? "bg-red-500/10 border-red-500/50 text-red-500 shadow-[0_0_10px_rgba(239,68,68,0.2)]" : "bg-white/5 border-white/10 text-muted-foreground hover:bg-white/10 hover:text-white"}`}>
                {isRecording ? <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> : <Circle className="w-2 h-2 group-hover:text-white transition-colors" />}
                {isRecording ? "REC" : "LOG"}
+            </button>
+            <button onClick={toggleUnits} className="px-3 py-2 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-bold uppercase tracking-wider text-muted-foreground hover:text-white transition-all active:scale-95">
+               {units === 'metric' ? 'MET' : 'IMP'}
             </button>
             <button onClick={() => setIsGestureMode(!isGestureMode)} className={`p-2 rounded-full border text-[10px] transition-all active:scale-95 ${isGestureMode ? "bg-green-500/10 border-green-500/50 text-green-500" : "bg-white/5 border-white/10 text-muted-foreground hover:text-white"}`}>
                {isGestureMode ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
