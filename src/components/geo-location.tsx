@@ -7,7 +7,7 @@ import {
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
   Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan,
-  ArrowUp, Hand, Video, VideoOff, Eye, Zap
+  ArrowUp, Hand, Video, VideoOff, Eye, Zap, Aperture, Target
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -15,6 +15,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import Webcam from "react-webcam";
 import * as tf from "@tensorflow/tfjs";
 import * as handpose from "@tensorflow-models/handpose";
+import * as cocoSsd from "@tensorflow-models/coco-ssd"; // IMPORT COCO-SSD
 import '@tensorflow/tfjs-backend-webgl';
 
 // --- Mapbox GL JS ---
@@ -231,7 +232,7 @@ const useGeolocation = () => {
       watchId.current = navigator.geolocation.watchPosition(
         ({ coords }: GeolocationPosition) => {
           const now = Date.now();
-          if (now - lastUpdate.current < 500) return; // Throttle 500ms
+          if (now - lastUpdate.current < 500) return;
           if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
           lastUpdate.current = now;
 
@@ -379,7 +380,138 @@ const useDebounce = <T,>(value: T, delay: number): T => {
   return debouncedValue;
 };
 
-// --- OPTIMIZED GESTURE COMPONENT ---
+// --- TACTICAL SCANNER (Object Detection) ---
+const TacticalScanner = memo(() => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [model, setModel] = useState<cocoSsd.ObjectDetection | null>(null);
+  const [loading, setLoading] = useState(true);
+  const isMountedRef = useRef(true);
+
+  // Load COCO-SSD
+  useEffect(() => {
+    isMountedRef.current = true;
+    const loadAI = async () => {
+      try {
+        await tf.ready();
+        await tf.setBackend('webgl');
+        const loadedModel = await cocoSsd.load({ base: 'lite_mobilenet_v2' }); // Use lightweight version
+        if (isMountedRef.current) {
+          setModel(loadedModel);
+          setLoading(false);
+        }
+      } catch (err) {
+        console.error("Scanner Load Error", err);
+      }
+    };
+    loadAI();
+    return () => { isMountedRef.current = false; };
+  }, []);
+
+  // Detection Loop
+  useEffect(() => {
+    if (!model) return;
+    let rafId: number;
+    let timeoutId: NodeJS.Timeout;
+    const DETECTION_INTERVAL = 150; // Throttle to save battery
+
+    const detect = async () => {
+      if (!isMountedRef.current) return;
+      if (videoRef.current && videoRef.current.readyState === 4 && canvasRef.current) {
+        
+        // Get Predictions
+        const predictions = await model.detect(videoRef.current, 5, 0.5); // Max 5 objects, 50% threshold
+
+        if (isMountedRef.current && canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx && videoRef.current) {
+            // Match canvas size to video
+            canvasRef.current.width = videoRef.current.videoWidth;
+            canvasRef.current.height = videoRef.current.videoHeight;
+            
+            // Clear & Draw
+            ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+            ctx.font = '14px "Courier New", monospace';
+            ctx.lineWidth = 2;
+
+            predictions.forEach(prediction => {
+              const [x, y, width, height] = prediction.bbox;
+              const label = prediction.class.toUpperCase();
+              const score = Math.round(prediction.score * 100);
+
+              // Draw Brackets (Tactical Style)
+              ctx.strokeStyle = '#22c55e'; // Green
+              ctx.fillStyle = '#22c55e';
+              
+              // Box
+              ctx.strokeRect(x, y, width, height);
+              
+              // Label BG
+              ctx.fillRect(x, y - 20, ctx.measureText(`${label} ${score}%`).width + 10, 20);
+              
+              // Text
+              ctx.fillStyle = '#000';
+              ctx.fillText(`${label} ${score}%`, x + 5, y - 5);
+            });
+          }
+        }
+      }
+      
+      timeoutId = setTimeout(() => {
+        rafId = requestAnimationFrame(detect);
+      }, DETECTION_INTERVAL);
+    };
+
+    detect();
+    return () => { 
+      cancelAnimationFrame(rafId);
+      clearTimeout(timeoutId);
+    };
+  }, [model]);
+
+  return (
+    <div className="absolute inset-0 z-50 bg-black">
+        {/* Webcam Feed (Back Camera) */}
+        <Webcam
+          ref={(webcam: any) => { videoRef.current = webcam?.video || null; }}
+          className="absolute inset-0 w-full h-full object-cover"
+          videoConstraints={{ facingMode: "environment" }}
+          muted
+        />
+        {/* HUD Overlay Canvas */}
+        <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-cover" />
+        
+        {/* Loading State */}
+        {loading && (
+           <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-50">
+              <div className="flex flex-col items-center gap-4">
+                 <Loader2 className="w-12 h-12 text-green-500 animate-spin" />
+                 <span className="text-green-500 font-mono tracking-widest animate-pulse">LOADING OPTICS...</span>
+              </div>
+           </div>
+        )}
+
+        {/* UI Overlay */}
+        <div className="absolute top-4 left-4 flex gap-2">
+            <div className="px-3 py-1 bg-green-500/20 border border-green-500/50 text-green-500 text-xs font-black tracking-widest rounded uppercase animate-pulse">
+                Scanner Active
+            </div>
+        </div>
+        
+        {/* Crosshair Overlay */}
+        <div className="absolute inset-0 pointer-events-none flex items-center justify-center opacity-30">
+            <div className="w-64 h-64 border border-white/30 rounded-full flex items-center justify-center">
+                <div className="w-1 h-2 bg-white/50" />
+            </div>
+            <div className="absolute w-full h-px bg-white/10" />
+            <div className="absolute h-full w-px bg-white/10" />
+        </div>
+    </div>
+  );
+});
+TacticalScanner.displayName = "TacticalScanner";
+
+// --- GESTURE COMPONENT ---
 const GestureOps = memo(({ 
   onToggleRecording, 
   onToggleMapMode,
@@ -393,25 +525,21 @@ const GestureOps = memo(({
   const [model, setModel] = useState<handpose.HandPose | null>(null);
   const [loading, setLoading] = useState(true);
   const [gestureState, setGestureState] = useState<'neutral' | 'pinch' | 'fist'>('neutral');
-  const [debugMsg, setDebugMsg] = useState("Initializing AI...");
+  const [debugMsg, setDebugMsg] = useState("AI Init...");
   const isMountedRef = useRef(true);
 
-  // Performance Optimization: Run TF.js configuration once
   useEffect(() => {
     isMountedRef.current = true;
     const initTF = async () => {
       try {
         await tf.ready();
-        // Force WebGL backend
         await tf.setBackend('webgl');
-        // Optimize WebGL flags for mobile garbage collection
         tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
-        
         const net = await handpose.load();
         if (isMountedRef.current) {
           setModel(net);
           setLoading(false);
-          setDebugMsg("AI Ready");
+          setDebugMsg("Ops Ready");
         }
       } catch (e) {
         console.error("AI Load Failed", e);
@@ -422,63 +550,37 @@ const GestureOps = memo(({
     return () => { isMountedRef.current = false; };
   }, []);
 
-  // Performance Optimization: Detection Loop
   useEffect(() => {
     if (!model) return;
-
     let rafId: number;
     let timeoutId: NodeJS.Timeout;
     let lastActionTime = 0;
-    
-    // Confidence counters to prevent accidental triggers
     let consecutivePinchFrames = 0;
     let consecutiveFistFrames = 0;
     const FRAMES_TO_TRIGGER = 3; 
     const ACTION_COOLDOWN = 1200; 
-    
-    // THROTTLE: Only run detection every ~150ms (approx 6-7 FPS) to save battery
     const DETECTION_INTERVAL = 150; 
 
     const loop = async () => {
       if (!isMountedRef.current) return;
-
-      if (
-        webcamRef.current &&
-        webcamRef.current.video &&
-        webcamRef.current.video.readyState === 4
-      ) {
+      if (webcamRef.current && webcamRef.current.video && webcamRef.current.video.readyState === 4) {
         const video = webcamRef.current.video;
-        
-        // Use tf.tidy to automatically clean up intermediate tensors
         const hands = await model.estimateHands(video);
 
         if (isMountedRef.current) {
           if (hands.length > 0) {
             const landmarks = hands[0].landmarks;
-
-            // 1. PINCH (Thumb tip to Index tip)
             const thumbTip = landmarks[4];
             const indexTip = landmarks[8];
-            const pinchDist = Math.sqrt(
-              Math.pow(thumbTip[0] - indexTip[0], 2) +
-              Math.pow(thumbTip[1] - indexTip[1], 2)
-            );
-
-            // 2. FIST (Thumb tip to Pinky tip)
+            const pinchDist = Math.sqrt(Math.pow(thumbTip[0] - indexTip[0], 2) + Math.pow(thumbTip[1] - indexTip[1], 2));
             const pinkyTip = landmarks[20];
-            const fistDist = Math.sqrt(
-              Math.pow(thumbTip[0] - pinkyTip[0], 2) +
-              Math.pow(thumbTip[1] - pinkyTip[1], 2)
-            );
-
+            const fistDist = Math.sqrt(Math.pow(thumbTip[0] - pinkyTip[0], 2) + Math.pow(thumbTip[1] - pinkyTip[1], 2));
             const now = Date.now();
 
-            // Check distances (thresholds calibrated for 160px width)
             if (pinchDist < 25) {
               consecutivePinchFrames++;
               consecutiveFistFrames = 0;
               setGestureState('pinch');
-
               if (consecutivePinchFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
                 triggerHaptic();
                 onToggleMapMode();
@@ -490,7 +592,6 @@ const GestureOps = memo(({
               consecutiveFistFrames++;
               consecutivePinchFrames = 0;
               setGestureState('fist');
-
               if (consecutiveFistFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
                 triggerHaptic();
                 onToggleRecording();
@@ -509,38 +610,18 @@ const GestureOps = memo(({
           }
         }
       }
-      
-      // Throttle the loop
-      timeoutId = setTimeout(() => {
-        rafId = requestAnimationFrame(loop);
-      }, DETECTION_INTERVAL);
+      timeoutId = setTimeout(() => { rafId = requestAnimationFrame(loop); }, DETECTION_INTERVAL);
     };
-
     loop();
-
-    return () => { 
-      cancelAnimationFrame(rafId);
-      clearTimeout(timeoutId);
-    };
+    return () => { cancelAnimationFrame(rafId); clearTimeout(timeoutId); };
   }, [model, onToggleRecording, onToggleMapMode, isRecording]);
 
   return (
     <div className="absolute top-20 right-4 w-28 h-36 bg-black/90 rounded-xl border border-green-500/30 overflow-hidden z-50 shadow-2xl backdrop-blur-md transition-all animate-in fade-in zoom-in duration-300">
-       <Webcam
-          ref={webcamRef}
-          className="absolute inset-0 w-full h-full object-cover opacity-50 grayscale"
-          mirrored={true}
-          // OPTIMIZATION: Ultra-low resolution for faster processing
-          videoConstraints={{ width: 160, height: 120, facingMode: "user" }}
-          screenshotFormat="image/jpeg"
-       />
-       
+       <Webcam ref={webcamRef} className="absolute inset-0 w-full h-full object-cover opacity-50 grayscale" mirrored={true} videoConstraints={{ width: 160, height: 120, facingMode: "user" }} screenshotFormat="image/jpeg" />
        <div className="absolute inset-0 flex flex-col items-center justify-between p-2 pointer-events-none">
           {loading ? (
-            <div className="flex flex-col items-center justify-center h-full gap-2">
-                <Loader2 className="w-6 h-6 animate-spin text-green-500" />
-                <span className="text-[8px] font-mono text-green-500/80 animate-pulse">BOOTING AI</span>
-            </div>
+            <div className="flex flex-col items-center justify-center h-full gap-2"><Loader2 className="w-6 h-6 animate-spin text-green-500" /><span className="text-[8px] font-mono text-green-500/80 animate-pulse">BOOTING AI</span></div>
           ) : (
              <div className="mt-8 transition-all duration-200">
                {gestureState === 'neutral' && <Hand className="w-8 h-8 text-white/40" />}
@@ -548,24 +629,13 @@ const GestureOps = memo(({
                {gestureState === 'fist' && <Circle className="w-8 h-8 text-red-500 fill-red-500/50 animate-pulse drop-shadow-[0_0_8px_rgba(239,68,68,0.8)]" />}
              </div>
           )}
-          
-          {!loading && (
-            <div className="w-full bg-black/80 backdrop-blur-md rounded text-[8px] font-mono text-center py-1 text-green-400 border-t border-green-500/20">
-                {debugMsg}
-            </div>
-          )}
+          {!loading && <div className="w-full bg-black/80 backdrop-blur-md rounded text-[8px] font-mono text-center py-1 text-green-400 border-t border-green-500/20">{debugMsg}</div>}
        </div>
-
-       {/* Corner Accents */}
        <div className="absolute top-0 left-0 w-2 h-2 border-l border-t border-green-500/50" />
        <div className="absolute top-0 right-0 w-2 h-2 border-r border-t border-green-500/50" />
        <div className="absolute bottom-0 left-0 w-2 h-2 border-l border-b border-green-500/50" />
        <div className="absolute bottom-0 right-0 w-2 h-2 border-r border-b border-green-500/50" />
-       
-       {/* Active Indicator */}
-       <div className="absolute top-1 right-1">
-           <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse shadow-[0_0_5px_#22c55e]" />
-       </div>
+       <div className="absolute top-1 right-1"><div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse shadow-[0_0_5px_#22c55e]" /></div>
     </div>
   );
 });
@@ -1076,6 +1146,7 @@ export default function GeoLocation() {
   const [recordedPath, setRecordedPath] = useState<GeoPoint[]>([]);
   const [showSaveButton, setShowSaveButton] = useState(false);
   const [isGestureMode, setIsGestureMode] = useState(false);
+  const [isScannerMode, setIsScannerMode] = useState(false); // New state for Scanner
   
   const isMountedRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -1127,6 +1198,20 @@ export default function GeoLocation() {
       setIsRecording(true);
     }
   }, [isRecording, recordedPath]);
+
+  const toggleScanner = useCallback(() => {
+    triggerHaptic();
+    setIsScannerMode(prev => !prev);
+    // Disable gestures if scanner is active (conflict)
+    if (!isScannerMode) setIsGestureMode(false);
+  }, [isScannerMode]);
+
+  const toggleGestures = useCallback(() => {
+    triggerHaptic();
+    setIsGestureMode(prev => !prev);
+    // Disable scanner if gestures active
+    if (!isGestureMode) setIsScannerMode(false);
+  }, [isGestureMode]);
 
   const downloadGPX = useCallback(() => {
     triggerHaptic();
@@ -1260,13 +1345,28 @@ export default function GeoLocation() {
             <button onClick={toggleUnits} className="px-3 py-2 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-bold uppercase tracking-wider text-muted-foreground hover:text-white transition-all active:scale-95">
                {units === 'metric' ? 'MET' : 'IMP'}
             </button>
-            <button onClick={() => setIsGestureMode(!isGestureMode)} className={`p-2 rounded-full border text-[10px] transition-all active:scale-95 ${isGestureMode ? "bg-green-500/10 border-green-500/50 text-green-500" : "bg-white/5 border-white/10 text-muted-foreground hover:text-white"}`}>
+            
+            {/* Gesture Toggle */}
+            <button onClick={toggleGestures} className={`p-2 rounded-full border text-[10px] transition-all active:scale-95 ${isGestureMode ? "bg-green-500/10 border-green-500/50 text-green-500" : "bg-white/5 border-white/10 text-muted-foreground hover:text-white"}`}>
                {isGestureMode ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
+            </button>
+
+            {/* Scanner Toggle */}
+            <button onClick={toggleScanner} className={`p-2 rounded-full border text-[10px] transition-all active:scale-95 ${isScannerMode ? "bg-green-500/10 border-green-500/50 text-green-500" : "bg-white/5 border-white/10 text-muted-foreground hover:text-white"}`}>
+               <Aperture className="w-4 h-4" />
             </button>
          </div>
       </div>
 
       {isGestureMode && <GestureOps onToggleRecording={toggleRecording} onToggleMapMode={toggleMapMode} isRecording={isRecording} />}
+      {isScannerMode && (
+        <div className="fixed inset-0 z-50 animate-in fade-in zoom-in duration-300">
+            <TacticalScanner />
+            <button onClick={toggleScanner} className="absolute top-4 right-4 z-[60] p-3 bg-black/50 border border-white/20 rounded-full text-white backdrop-blur-md">
+                <X className="w-6 h-6" />
+            </button>
+        </div>
+      )}
 
       <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 z-10">
         {loading && !coords && (
