@@ -6,12 +6,11 @@ import {
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
-  Share2, Signal, Plus, Minus, Copy, Check
+  Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 // --- Mapbox GL JS ---
-// Note: Ensure mapbox-gl is installed: `npm install mapbox-gl`
 import mapboxgl from 'mapbox-gl';
 import 'mapbox-gl/dist/mapbox-gl.css';
 
@@ -20,14 +19,13 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 mapboxgl.accessToken = MAPBOX_TOKEN;
 
-// Settings
-const RADAR_ZOOM = 18; // Zoom level for the radar view
-const TRAIL_MAX_POINTS = 100; // Visual trail length
-const TRAIL_MIN_DISTANCE = 5; // Meters between trail points
-const MAP_UPDATE_THRESHOLD = 80; // Meters before reloading radar background
-const API_FETCH_DISTANCE_THRESHOLD = 2.0; // Kilometers before refreshing weather/address
-const REC_MIN_DISTANCE = 5; // Meters between recorded GPX points
-const GPS_HEADING_THRESHOLD = 1.0; // Speed (m/s) required to switch to GPS heading
+const RADAR_ZOOM = 18;
+const TRAIL_MAX_POINTS = 100; 
+const TRAIL_MIN_DISTANCE = 5; 
+const MAP_UPDATE_THRESHOLD = 80; 
+const API_FETCH_DISTANCE_THRESHOLD = 2.0; 
+const REC_MIN_DISTANCE = 5; 
+const GPS_HEADING_THRESHOLD = 1.0; 
 
 // --- Types ---
 type Coordinates = {
@@ -60,6 +58,7 @@ type GeoPoint = { lat: number; lng: number; alt: number | null; timestamp: numbe
 type UnitSystem = 'metric' | 'imperial';
 
 type MapMode = 'heading-up' | 'north-up';
+type MapStyle = 'satellite' | 'dark';
 
 interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
   webkitCompassHeading?: number;
@@ -132,7 +131,15 @@ const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => 
   return R * c;
 };
 
-// Optimized projection for local radar
+const calculateTotalDistance = (points: GeoPoint[]) => {
+  if (points.length < 2) return 0;
+  let total = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    total += getDistance(points[i].lat, points[i].lng, points[i+1].lat, points[i+1].lng);
+  }
+  return total;
+};
+
 const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: number, zoom: number) => {
   const TILE_SIZE = 512; 
   const worldSize = TILE_SIZE * Math.pow(2, zoom);
@@ -176,13 +183,9 @@ const useWakeLock = () => {
         if ('wakeLock' in navigator && document.visibilityState === 'visible') {
           wakeLock = await (navigator as any).wakeLock.request('screen');
         }
-      } catch (err) {
-        // Feature not available or denied
-      }
+      } catch (err) {}
     };
-    
     requestLock();
-    
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         requestLock();
@@ -191,7 +194,6 @@ const useWakeLock = () => {
         wakeLock = null;
       }
     };
-    
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       if (wakeLock) wakeLock.release().catch(() => {});
@@ -212,14 +214,11 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
-      // Performance: Throttle updates to ~5fps (200ms) to save battery and reduce React render thrashing
       if (now - lastUpdate.current < 200) return;
       if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
-      
       lastUpdate.current = now;
 
       setState(prev => {
-        // Diff check to prevent re-render if data hasn't effectively changed
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
@@ -227,7 +226,6 @@ const useGeolocation = () => {
             prev.coords.speed === coords.speed) {
           return prev;
         }
-        
         return {
           coords: {
             latitude: coords.latitude,
@@ -248,18 +246,14 @@ const useGeolocation = () => {
       switch(error.code) {
         case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
         case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return; // Don't wipe state on timeout, just wait
+        case error.TIMEOUT: return; 
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
 
     const watcher = navigator.geolocation.watchPosition(
       handleSuccess, handleError, 
-      { 
-        enableHighAccuracy: true, 
-        timeout: 20000, 
-        maximumAge: 0 
-      }
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
     );
 
     return () => navigator.geolocation.clearWatch(watcher);
@@ -271,10 +265,21 @@ const useGeolocation = () => {
 const useCompass = () => {
   const [visualHeading, setVisualHeading] = useState<number | null>(null);
   const [trueHeading, setTrueHeading] = useState<number | null>(null);
+  const [pitch, setPitch] = useState<number>(0);
+  const [roll, setRoll] = useState<number>(0);
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const targetRef = useRef<number>(0);
-  const currentRef = useRef<number>(0);
+  
+  // Refs for smoothing loop
+  const targetHeadingRef = useRef<number>(0);
+  const currentHeadingRef = useRef<number>(0);
+  
+  const targetPitchRef = useRef<number>(0);
+  const currentPitchRef = useRef<number>(0);
+  
+  const targetRollRef = useRef<number>(0);
+  const currentRollRef = useRef<number>(0);
+
   const rafIdRef = useRef<number | null>(null);
   const isMounted = useRef(true);
 
@@ -283,29 +288,37 @@ const useCompass = () => {
     return () => { isMounted.current = false; };
   }, []);
   
-  // Animation Loop for Smooth Compass
   useEffect(() => {
     if (!permissionGranted) return;
     
     let isRunning = true;
     const loop = () => {
       if (!isRunning || !isMounted.current) return;
-      const diff = targetRef.current - currentRef.current;
-      
-      // Performance: Stop animating if difference is negligible to save battery
-      if (Math.abs(diff) < 0.05) {
-         if (currentRef.current !== targetRef.current) {
-            currentRef.current = targetRef.current;
-            setVisualHeading((currentRef.current % 360 + 360) % 360);
-         }
-         // Poll slower when static
-         setTimeout(() => { if (isRunning) rafIdRef.current = requestAnimationFrame(loop); }, 100);
-         return;
+
+      // Heading Smoothing
+      const hDiff = targetHeadingRef.current - currentHeadingRef.current;
+      if (Math.abs(hDiff) > 0.1) {
+          currentHeadingRef.current += hDiff * 0.15;
+          setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
+      } else if (currentHeadingRef.current !== targetHeadingRef.current) {
+          currentHeadingRef.current = targetHeadingRef.current;
+          setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
+      }
+
+      // Pitch Smoothing
+      const pDiff = targetPitchRef.current - currentPitchRef.current;
+      if (Math.abs(pDiff) > 0.1) {
+          currentPitchRef.current += pDiff * 0.1; // Slower for weight
+          setPitch(currentPitchRef.current);
+      }
+
+      // Roll Smoothing
+      const rDiff = targetRollRef.current - currentRollRef.current;
+      if (Math.abs(rDiff) > 0.1) {
+          currentRollRef.current += rDiff * 0.1;
+          setRoll(currentRollRef.current);
       }
       
-      // Lerp for smoothness
-      currentRef.current += diff * 0.15;
-      setVisualHeading((currentRef.current % 360 + 360) % 360);
       rafIdRef.current = requestAnimationFrame(loop);
     };
 
@@ -337,6 +350,7 @@ const useCompass = () => {
     if (!permissionGranted || typeof window === 'undefined') return;
 
     const handleOrientation = (e: any) => {
+      // Heading Logic
       let degree: number | null = null;
       if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
         degree = e.webkitCompassHeading;
@@ -347,15 +361,18 @@ const useCompass = () => {
       if (degree !== null) {
         const normalized = ((degree) + 360) % 360;
         setTrueHeading(normalized);
-        const current = targetRef.current;
+        const current = targetHeadingRef.current;
         const currentMod = (current % 360 + 360) % 360;
         
-        // Calculate shortest path rotation
         let delta = normalized - currentMod;
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
-        targetRef.current = current + delta;
+        targetHeadingRef.current = current + delta;
       }
+
+      // Pitch & Roll Logic
+      if (e.beta !== null) targetPitchRef.current = e.beta;
+      if (e.gamma !== null) targetRollRef.current = e.gamma;
     };
 
     const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
@@ -363,7 +380,7 @@ const useCompass = () => {
     return () => window.removeEventListener(eventName, handleOrientation, true);
   }, [permissionGranted]);
 
-  return { heading: visualHeading, trueHeading, requestAccess, permissionGranted, error };
+  return { heading: visualHeading, trueHeading, pitch, roll, requestAccess, permissionGranted, error };
 };
 
 const useDebounce = <T,>(value: T, delay: number): T => {
@@ -376,6 +393,64 @@ const useDebounce = <T,>(value: T, delay: number): T => {
 };
 
 // --- UI Components ---
+
+// New Inclinometer Component
+const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number | null }) => {
+  const p = pitch || 0;
+  const r = roll || 0;
+
+  // Clamp visual movement to avoid sky/ground disappearing completely
+  const visualP = Math.max(Math.min(p, 45), -45);
+
+  return (
+    <div className="relative w-32 h-32 rounded-full border-4 border-white/10 bg-black/80 overflow-hidden backdrop-blur-md shadow-[inset_0_0_20px_rgba(0,0,0,1)]">
+      {/* Background Grid */}
+      <div className="absolute inset-0 opacity-20 bg-[linear-gradient(transparent_19px,#22c55e_20px),linear-gradient(90deg,transparent_19px,#22c55e_20px)] bg-[size:20px_20px]" />
+      
+      {/* Artificial Horizon */}
+      <div 
+        className="absolute inset-[-50%] transition-transform duration-75 ease-linear origin-center will-change-transform"
+        style={{ 
+          transform: `rotate(${-r}deg) translateY(${visualP * 2}px)`,
+        }}
+      >
+        <div className="w-full h-1/2 bg-[#0099ff]/30 border-b-2 border-white/50" /> {/* Sky */}
+        <div className="w-full h-1/2 bg-[#8b4513]/30 border-t-2 border-white/50" /> {/* Ground */}
+      </div>
+
+      {/* Degree Markers */}
+      <div className="absolute inset-0 pointer-events-none opacity-50">
+        <div className="absolute top-1/2 left-2 w-2 h-px bg-white" />
+        <div className="absolute top-1/2 right-2 w-2 h-px bg-white" />
+        <div className="absolute top-2 left-1/2 w-px h-2 bg-white" />
+        <div className="absolute bottom-2 left-1/2 w-px h-2 bg-white" />
+      </div>
+
+      {/* Reticle (Fixed) */}
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <div className="w-12 h-0.5 bg-yellow-500/90 shadow-[0_0_5px_rgba(234,179,8,0.8)]" />
+        <div className="absolute w-1.5 h-1.5 rounded-full bg-yellow-500 shadow-[0_0_5px_rgba(234,179,8,0.8)]" />
+        <div className="absolute w-20 h-20 border border-white/10 rounded-full" />
+      </div>
+
+      {/* Glass Reflection Effect */}
+      <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-transparent via-white/5 to-transparent pointer-events-none" />
+
+      {/* Readouts */}
+      <div className="absolute bottom-4 inset-x-0 flex justify-between px-6 text-[8px] font-mono font-bold text-white/60 pointer-events-none">
+        <div className="flex flex-col items-center">
+            <span>R</span>
+            <span className="text-white tabular-nums">{r.toFixed(0)}°</span>
+        </div>
+        <div className="flex flex-col items-center">
+            <span>P</span>
+            <span className="text-white tabular-nums">{p.toFixed(0)}°</span>
+        </div>
+      </div>
+    </div>
+  );
+});
+Inclinometer.displayName = "Inclinometer";
 
 const RadarMapbox = memo(({ 
   path, 
@@ -400,8 +475,8 @@ const RadarMapbox = memo(({
   const [isOffCenter, setIsOffCenter] = useState(false);
   const [imgLoaded, setImgLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
+  const [mapStyle, setMapStyle] = useState<MapStyle>('satellite');
 
-  // Update anchor only when moved significantly to prevent constant image reloading
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
     setIsOffCenter(distance > 30); 
@@ -413,9 +488,11 @@ const RadarMapbox = memo(({
     }
   }, [lat, lng, anchor]);
 
+  const styleId = mapStyle === 'satellite' ? 'satellite-streets-v12' : 'dark-v11';
+  
   const currentMapUrl = useMemo(() => 
-    `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/600x600@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
-  [anchor.lat, anchor.lng]);
+    `https://api.mapbox.com/styles/v1/mapbox/${styleId}/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/600x600@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
+  [anchor.lat, anchor.lng, styleId]);
 
   const { userX, userY, svgPath } = useMemo(() => {
     const userPos = geoToPixels(lat, lng, anchor.lat, anchor.lng, RADAR_ZOOM);
@@ -433,18 +510,22 @@ const RadarMapbox = memo(({
   const rotation = mode === 'heading-up' ? heading : 0;
   const markerRotation = mode === 'heading-up' ? 0 : heading;
   
-  // Dynamic accuracy circle color
   const accColor = !accuracy ? 'border-muted/20' 
     : accuracy < 10 ? 'border-green-500/50' 
     : accuracy < 30 ? 'border-yellow-500/50' 
     : 'border-red-500/50';
+
+  const toggleStyle = useCallback(() => {
+      triggerHaptic();
+      setMapStyle(prev => prev === 'satellite' ? 'dark' : 'satellite');
+      setImgLoaded(false);
+  }, []);
 
   return (
     <div className="relative w-64 h-64 md:w-80 md:h-80 shrink-0 transition-all duration-300">
       <div className="absolute inset-0 rounded-full border border-border/20 bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
       <div className="w-full h-full relative isolate">
         
-        {/* Map Container - Rotates based on mode */}
         <div 
           className="absolute inset-0 rounded-full overflow-hidden bg-black z-0"
           style={{ maskImage: 'radial-gradient(white, black)', transform: 'translateZ(0)' }}
@@ -464,16 +545,15 @@ const RadarMapbox = memo(({
                {!mapError && (
                  <img
                    src={currentMapUrl}
-                   alt="Satellite View"
+                   alt="Map View"
                    onLoad={() => setImgLoaded(true)}
                    onError={() => setMapError(true)}
                    className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
-                   style={{ filter: 'grayscale(0.3) contrast(1.1) brightness(0.8)' }}
+                   style={{ filter: mapStyle === 'satellite' ? 'grayscale(0.3) contrast(1.1) brightness(0.8)' : 'contrast(1.2) brightness(0.8)' }}
                  />
                )}
             </div>
             
-            {/* SVG Overlay for Trail & Marker */}
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
               <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
                 {svgPath && (
@@ -491,7 +571,6 @@ const RadarMapbox = memo(({
           </div>
         </div>
 
-        {/* HUD Elements */}
         <div className={`absolute inset-0 rounded-full border-4 ${accColor} pointer-events-none z-10 transition-colors duration-500`} />
         <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20 rounded-full" />
         <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
@@ -511,16 +590,25 @@ const RadarMapbox = memo(({
         </div>
         
         {imgLoaded && !mapError && (
-          <div className="absolute bottom-3 right-4 text-[8px] font-black tracking-widest text-white/40 z-30 font-mono">SAT FEED</div>
+          <div className="absolute bottom-3 right-4 text-[8px] font-black tracking-widest text-white/40 z-30 font-mono uppercase">{mapStyle === 'satellite' ? 'SAT FEED' : 'VECT FEED'}</div>
         )}
-
-        <button
-           onClick={() => { triggerHaptic(); onToggleMode(); }}
-           type="button"
-           className="absolute bottom-4 left-1/2 -translate-x-1/2 text-[9px] font-bold tracking-widest text-green-400 bg-black/80 px-3 py-1.5 rounded-sm backdrop-blur-md z-40 border border-green-500/30 shadow-lg pointer-events-auto active:scale-95 active:bg-green-900/50 transition-all touch-manipulation"
-        >
-          {mode === 'heading-up' ? 'HDG UP' : 'NTH UP'}
-        </button>
+        
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex gap-2 z-40 pointer-events-auto">
+            <button
+               onClick={() => { triggerHaptic(); onToggleMode(); }}
+               type="button"
+               className="text-[9px] font-bold tracking-widest text-green-400 bg-black/80 px-3 py-1.5 rounded-sm backdrop-blur-md border border-green-500/30 shadow-lg active:scale-95 active:bg-green-900/50 transition-all touch-manipulation"
+            >
+              {mode === 'heading-up' ? 'HDG UP' : 'NTH UP'}
+            </button>
+            <button
+               onClick={toggleStyle}
+               type="button"
+               className="p-1.5 rounded-sm bg-black/80 backdrop-blur-md border border-white/20 text-white/70 hover:text-white hover:bg-white/10 active:scale-95 transition-all touch-manipulation"
+            >
+              <Layers className="w-3 h-3" />
+            </button>
+        </div>
       </div>
 
       {isOffCenter && (
@@ -754,7 +842,7 @@ const CoordinateRow = memo(({
 });
 CoordinateRow.displayName = "CoordinateRow";
 
-// --- FULL MAP DRAWER (Now using Mapbox GL JS) ---
+// --- FULL MAP DRAWER ---
 const FullMapDrawer = memo(({ 
   isOpen, 
   onClose, 
@@ -772,10 +860,9 @@ const FullMapDrawer = memo(({
   const marker = useRef<mapboxgl.Marker | null>(null);
   const [zoomLevel, setZoomLevel] = useState(16);
 
-  // Initialize Map
   useEffect(() => {
     if (!isOpen || !mapContainer.current) return;
-    if (map.current) return; // Initialize only once
+    if (map.current) return; 
 
     try {
       map.current = new mapboxgl.Map({
@@ -788,7 +875,6 @@ const FullMapDrawer = memo(({
 
       map.current.addControl(new mapboxgl.AttributionControl({ compact: true }), 'bottom-right');
 
-      // Custom CSS Marker
       const el = document.createElement('div');
       el.className = 'marker';
       el.innerHTML = `
@@ -815,7 +901,6 @@ const FullMapDrawer = memo(({
     }
   }, [isOpen]);
 
-  // Clean up Map on unmount to prevent WebGL memory leaks
   useEffect(() => {
     return () => {
       if (map.current) {
@@ -825,14 +910,11 @@ const FullMapDrawer = memo(({
     };
   }, []);
 
-  // Handle Updates
   useEffect(() => {
     if (!map.current) return;
     
-    // Update marker position
     if (marker.current) marker.current.setLngLat([lng, lat]);
 
-    // Only FlyTo if we moved significantly
     const currentCenter = map.current.getCenter();
     const dist = getDistance(currentCenter.lat, currentCenter.lng, lat, lng);
     
@@ -841,13 +923,12 @@ const FullMapDrawer = memo(({
     }
   }, [lat, lng]);
 
-  // Handle Resize when Drawer opens
   useEffect(() => {
     if (isOpen && map.current) {
       setTimeout(() => {
         map.current?.resize();
         map.current?.flyTo({ center: [lng, lat] });
-      }, 300); // Wait for CSS transition
+      }, 300); 
     }
   }, [isOpen]);
 
@@ -873,7 +954,6 @@ const FullMapDrawer = memo(({
       
       <div className={`fixed bottom-0 left-0 right-0 h-[92dvh] bg-[#0c0c0c] border-t border-white/10 rounded-t-[2rem] shadow-2xl z-[61] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) flex flex-col ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
         
-        {/* --- Header --- */}
         <div className="absolute top-0 left-0 right-0 z-[65] p-6 pt-8 flex justify-between items-start pointer-events-none bg-gradient-to-b from-black/80 to-transparent">
             <div className="pointer-events-auto space-y-1">
                 <div className="flex items-center gap-2">
@@ -896,23 +976,19 @@ const FullMapDrawer = memo(({
             </button>
         </div>
 
-        {/* --- Map Container --- */}
         <div 
            className="relative flex-1 w-full h-full overflow-hidden bg-[#111]"
            ref={mapContainer}
         >
-           {/* Fallback Loader if map renders slowly */}
            <div className="absolute inset-0 flex items-center justify-center -z-10">
                <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
            </div>
 
-           {/* Static HUD Overlay (Reticle) */}
            <div className="absolute inset-0 pointer-events-none z-10 opacity-[0.05]" 
                 style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }} 
            />
         </div>
 
-        {/* --- Side Controls --- */}
         <div className="absolute right-4 top-1/2 -translate-y-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
              <div className="pointer-events-auto flex flex-col gap-2 bg-black/40 backdrop-blur-md p-1.5 rounded-2xl border border-white/10">
                  <button onClick={zoomIn} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Plus className="w-5 h-5"/></button>
@@ -921,7 +997,6 @@ const FullMapDrawer = memo(({
              </div>
         </div>
 
-        {/* --- Bottom Drawer Actions --- */}
         <div className="absolute bottom-0 left-0 right-0 z-[65] p-6 bg-gradient-to-t from-black via-black/90 to-transparent">
              <div className="grid grid-cols-2 gap-3 max-w-lg mx-auto">
                  <button onClick={() => window.open(`http://maps.apple.com/?ll=${lat},${lng}&q=${lat},${lng}`, '_blank')} className="flex items-center justify-center gap-2 py-4 rounded-xl bg-white/10 hover:bg-white/20 border border-white/10 text-white font-bold text-xs uppercase tracking-wider backdrop-blur-md transition-all active:scale-[0.98]">
@@ -941,7 +1016,8 @@ FullMapDrawer.displayName = "FullMapDrawer";
 // --- MAIN COMPONENT ---
 export default function GeoLocation() {
   const { coords, error, loading } = useGeolocation();
-  const { heading, trueHeading, requestAccess, permissionGranted, error: compassError } = useCompass();
+  // Get Pitch and Roll from our updated hook
+  const { heading, trueHeading, pitch, roll, requestAccess, permissionGranted, error: compassError } = useCompass();
   useWakeLock();
 
   const [address, setAddress] = useState<string | null>(null);
@@ -1101,6 +1177,14 @@ export default function GeoLocation() {
   }, [debouncedCoords, lastApiFetch, address, weather]);
 
   const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
+  
+  // Calculate total distance recorded
+  const recordedDistance = useMemo(() => {
+     if (!isRecording && recordedPath.length === 0) return 0;
+     const dist = calculateTotalDistance(recordedPath);
+     return units === 'metric' ? dist : dist * 3.28084;
+  }, [recordedPath, isRecording, units]);
+
   if (!mounted) return null;
 
   return (
@@ -1120,7 +1204,14 @@ export default function GeoLocation() {
              </div>
          </div>
 
-         <div className="flex gap-2">
+         <div className="flex gap-2 items-center">
+            {isRecording && (
+               <div className="px-3 py-1.5 bg-black/40 backdrop-blur-md rounded-full border border-red-500/20 mr-1 animate-in fade-in slide-in-from-right-2">
+                 <span className="text-[10px] font-mono font-bold text-red-400 tabular-nums">
+                   {(recordedDistance / (units === 'metric' ? 1000 : 5280)).toFixed(2)} {units === 'metric' ? 'km' : 'mi'}
+                 </span>
+               </div>
+            )}
             <button
                onClick={toggleRecording}
                className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all active:scale-95 ${
@@ -1206,7 +1297,7 @@ export default function GeoLocation() {
                  )}
              </div>
 
-             {/* Center Column: Visuals */}
+             {/* Center Column: Visuals (Compass + Inclinometer + Map) */}
              <div className="lg:col-span-8 flex flex-col md:flex-row items-center justify-center gap-12 order-1 md:order-2 p-0">
                  <CompassDisplay 
                     heading={effectiveHeading} 
@@ -1216,7 +1307,17 @@ export default function GeoLocation() {
                     permissionGranted={permissionGranted}
                     source={isMoving ? 'GPS' : 'MAG'}
                  />
+
+                 {/* New Inclinometer */}
+                 <div className="flex flex-col items-center gap-2 shrink-0">
+                    <Inclinometer pitch={pitch} roll={roll} />
+                    <span className="text-[9px] uppercase tracking-widest text-muted-foreground font-bold flex items-center gap-1">
+                        <RotateCw className="w-3 h-3" /> Gyro
+                    </span>
+                 </div>
+
                  <div className="h-px w-32 md:w-px md:h-32 bg-white/10" />
+                 
                  <div className="flex flex-col items-center gap-6">
                     <RadarMapbox 
                       path={path} 
