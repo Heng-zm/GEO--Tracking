@@ -11,22 +11,23 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 // --- Mapbox GL JS ---
-// Note: You must install mapbox-gl: `npm install mapbox-gl`
+// Note: Ensure mapbox-gl is installed: `npm install mapbox-gl`
 import mapboxgl from 'mapbox-gl';
 import 'mapbox-gl/dist/mapbox-gl.css';
 
 // --- Configuration ---
+// REPLACE THIS WITH YOUR OWN TOKEN FOR PRODUCTION
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
-// Set the token for the library
 mapboxgl.accessToken = MAPBOX_TOKEN;
 
-const RADAR_ZOOM = 18;
-const TRAIL_MAX_POINTS = 100; // Visual trail only
-const TRAIL_MIN_DISTANCE = 5; 
-const MAP_UPDATE_THRESHOLD = 80; // Distance in meters before reloading radar tile
-const API_FETCH_DISTANCE_THRESHOLD = 1.0; 
-const REC_MIN_DISTANCE = 5; 
-const GPS_HEADING_THRESHOLD = 1.0; 
+// Settings
+const RADAR_ZOOM = 18; // Zoom level for the radar view
+const TRAIL_MAX_POINTS = 100; // Visual trail length
+const TRAIL_MIN_DISTANCE = 5; // Meters between trail points
+const MAP_UPDATE_THRESHOLD = 80; // Meters before reloading radar background
+const API_FETCH_DISTANCE_THRESHOLD = 2.0; // Kilometers before refreshing weather/address
+const REC_MIN_DISTANCE = 5; // Meters between recorded GPX points
+const GPS_HEADING_THRESHOLD = 1.0; // Speed (m/s) required to switch to GPS heading
 
 // --- Types ---
 type Coordinates = {
@@ -131,6 +132,7 @@ const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => 
   return R * c;
 };
 
+// Optimized projection for local radar
 const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: number, zoom: number) => {
   const TILE_SIZE = 512; 
   const worldSize = TILE_SIZE * Math.pow(2, zoom);
@@ -174,9 +176,13 @@ const useWakeLock = () => {
         if ('wakeLock' in navigator && document.visibilityState === 'visible') {
           wakeLock = await (navigator as any).wakeLock.request('screen');
         }
-      } catch (err) {}
+      } catch (err) {
+        // Feature not available or denied
+      }
     };
+    
     requestLock();
+    
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         requestLock();
@@ -185,6 +191,7 @@ const useWakeLock = () => {
         wakeLock = null;
       }
     };
+    
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       if (wakeLock) wakeLock.release().catch(() => {});
@@ -205,17 +212,19 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
+      // Performance: Throttle updates to ~5fps (200ms) to save battery and reduce React render thrashing
       if (now - lastUpdate.current < 200) return;
       if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
+      
       lastUpdate.current = now;
 
       setState(prev => {
+        // Diff check to prevent re-render if data hasn't effectively changed
         if (prev.coords && 
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
-            prev.coords.speed === coords.speed &&
             prev.coords.heading === coords.heading &&
-            prev.coords.accuracy === coords.accuracy) {
+            prev.coords.speed === coords.speed) {
           return prev;
         }
         
@@ -239,14 +248,18 @@ const useGeolocation = () => {
       switch(error.code) {
         case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
         case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return; 
+        case error.TIMEOUT: return; // Don't wipe state on timeout, just wait
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
 
     const watcher = navigator.geolocation.watchPosition(
       handleSuccess, handleError, 
-      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+      { 
+        enableHighAccuracy: true, 
+        timeout: 20000, 
+        maximumAge: 0 
+      }
     );
 
     return () => navigator.geolocation.clearWatch(watcher);
@@ -263,28 +276,39 @@ const useCompass = () => {
   const targetRef = useRef<number>(0);
   const currentRef = useRef<number>(0);
   const rafIdRef = useRef<number | null>(null);
+  const isMounted = useRef(true);
+
+  useEffect(() => {
+    isMounted.current = true;
+    return () => { isMounted.current = false; };
+  }, []);
   
+  // Animation Loop for Smooth Compass
   useEffect(() => {
     if (!permissionGranted) return;
     
     let isRunning = true;
     const loop = () => {
-      if (!isRunning) return;
+      if (!isRunning || !isMounted.current) return;
       const diff = targetRef.current - currentRef.current;
       
+      // Performance: Stop animating if difference is negligible to save battery
       if (Math.abs(diff) < 0.05) {
          if (currentRef.current !== targetRef.current) {
             currentRef.current = targetRef.current;
             setVisualHeading((currentRef.current % 360 + 360) % 360);
          }
-         rafIdRef.current = requestAnimationFrame(loop);
+         // Poll slower when static
+         setTimeout(() => { if (isRunning) rafIdRef.current = requestAnimationFrame(loop); }, 100);
          return;
       }
       
+      // Lerp for smoothness
       currentRef.current += diff * 0.15;
       setVisualHeading((currentRef.current % 360 + 360) % 360);
       rafIdRef.current = requestAnimationFrame(loop);
     };
+
     rafIdRef.current = requestAnimationFrame(loop);
     return () => { 
       isRunning = false;
@@ -325,6 +349,8 @@ const useCompass = () => {
         setTrueHeading(normalized);
         const current = targetRef.current;
         const currentMod = (current % 360 + 360) % 360;
+        
+        // Calculate shortest path rotation
         let delta = normalized - currentMod;
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
@@ -375,6 +401,7 @@ const RadarMapbox = memo(({
   const [imgLoaded, setImgLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
 
+  // Update anchor only when moved significantly to prevent constant image reloading
   useEffect(() => {
     const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
     setIsOffCenter(distance > 30); 
@@ -405,6 +432,8 @@ const RadarMapbox = memo(({
 
   const rotation = mode === 'heading-up' ? heading : 0;
   const markerRotation = mode === 'heading-up' ? 0 : heading;
+  
+  // Dynamic accuracy circle color
   const accColor = !accuracy ? 'border-muted/20' 
     : accuracy < 10 ? 'border-green-500/50' 
     : accuracy < 30 ? 'border-yellow-500/50' 
@@ -415,6 +444,7 @@ const RadarMapbox = memo(({
       <div className="absolute inset-0 rounded-full border border-border/20 bg-background/50 backdrop-blur-3xl shadow-2xl z-0" />
       <div className="w-full h-full relative isolate">
         
+        {/* Map Container - Rotates based on mode */}
         <div 
           className="absolute inset-0 rounded-full overflow-hidden bg-black z-0"
           style={{ maskImage: 'radial-gradient(white, black)', transform: 'translateZ(0)' }}
@@ -442,6 +472,8 @@ const RadarMapbox = memo(({
                  />
                )}
             </div>
+            
+            {/* SVG Overlay for Trail & Marker */}
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
               <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
                 {svgPath && (
@@ -459,6 +491,7 @@ const RadarMapbox = memo(({
           </div>
         </div>
 
+        {/* HUD Elements */}
         <div className={`absolute inset-0 rounded-full border-4 ${accColor} pointer-events-none z-10 transition-colors duration-500`} />
         <div className="absolute inset-0 pointer-events-none bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay z-20 rounded-full" />
         <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_40px_rgba(0,0,0,0.8)] rounded-full" />
@@ -744,41 +777,53 @@ const FullMapDrawer = memo(({
     if (!isOpen || !mapContainer.current) return;
     if (map.current) return; // Initialize only once
 
-    map.current = new mapboxgl.Map({
-      container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/satellite-streets-v12',
-      center: [lng, lat],
-      zoom: 16,
-      attributionControl: false // Minimal UI
-    });
+    try {
+      map.current = new mapboxgl.Map({
+        container: mapContainer.current,
+        style: 'mapbox://styles/mapbox/satellite-streets-v12',
+        center: [lng, lat],
+        zoom: 16,
+        attributionControl: false
+      });
 
-    // Add Attribution manually if needed, or stick to small button
-    map.current.addControl(new mapboxgl.AttributionControl({ compact: true }), 'bottom-right');
+      map.current.addControl(new mapboxgl.AttributionControl({ compact: true }), 'bottom-right');
 
-    // Custom CSS Marker
-    const el = document.createElement('div');
-    el.className = 'marker';
-    el.innerHTML = `
-      <div style="position: relative; width: 20px; height: 20px; display: flex; justify-content: center; align-items: center;">
-        <div style="position: absolute; width: 100%; height: 100%; border-radius: 50%; background-color: rgba(34, 197, 94, 0.5); animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>
-        <div style="width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 10px rgba(34,197,94,0.8);"></div>
-      </div>
-      <style>
-        @keyframes ping {
-          75%, 100% { transform: scale(2); opacity: 0; }
-        }
-      </style>
-    `;
+      // Custom CSS Marker
+      const el = document.createElement('div');
+      el.className = 'marker';
+      el.innerHTML = `
+        <div style="position: relative; width: 20px; height: 20px; display: flex; justify-content: center; align-items: center;">
+          <div style="position: absolute; width: 100%; height: 100%; border-radius: 50%; background-color: rgba(34, 197, 94, 0.5); animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>
+          <div style="width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 10px rgba(34,197,94,0.8);"></div>
+        </div>
+        <style>
+          @keyframes ping {
+            75%, 100% { transform: scale(2); opacity: 0; }
+          }
+        </style>
+      `;
 
-    marker.current = new mapboxgl.Marker({ element: el })
-      .setLngLat([lng, lat])
-      .addTo(map.current);
+      marker.current = new mapboxgl.Marker({ element: el })
+        .setLngLat([lng, lat])
+        .addTo(map.current);
 
-    map.current.on('zoom', () => {
-      if(map.current) setZoomLevel(map.current.getZoom());
-    });
-
+      map.current.on('zoom', () => {
+        if(map.current) setZoomLevel(map.current.getZoom());
+      });
+    } catch (e) {
+      console.error("Map initialization failed", e);
+    }
   }, [isOpen]);
+
+  // Clean up Map on unmount to prevent WebGL memory leaks
+  useEffect(() => {
+    return () => {
+      if (map.current) {
+        map.current.remove();
+        map.current = null;
+      }
+    };
+  }, []);
 
   // Handle Updates
   useEffect(() => {
@@ -787,12 +832,10 @@ const FullMapDrawer = memo(({
     // Update marker position
     if (marker.current) marker.current.setLngLat([lng, lat]);
 
-    // Only FlyTo if we moved significantly or it's first load logic
-    // We don't want to wrestle control from user panning
+    // Only FlyTo if we moved significantly
     const currentCenter = map.current.getCenter();
     const dist = getDistance(currentCenter.lat, currentCenter.lng, lat, lng);
     
-    // If distance > 100m, auto-center. Otherwise let user pan.
     if (dist > 100) {
        map.current.flyTo({ center: [lng, lat], speed: 0.8 });
     }
