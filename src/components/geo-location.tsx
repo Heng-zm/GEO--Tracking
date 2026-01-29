@@ -6,8 +6,7 @@ import {
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
-  Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan,
-  ArrowUp
+  Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -26,6 +25,11 @@ const MAP_UPDATE_THRESHOLD = 80;
 const API_FETCH_DISTANCE_THRESHOLD = 2.0; 
 const REC_MIN_DISTANCE = 5; 
 const GPS_HEADING_THRESHOLD = 1.0; 
+
+// --- Constants ---
+const COMPASS_TICKS = [...Array(72)].map((_, i) => i);
+const PITCH_LADDER_LINES = [-60, -50, -40, -30, -20, -10, 10, 20, 30, 40, 50, 60];
+const BANKING_SCALE_TICKS = [-30, -20, -10, 10, 20, 30];
 
 // --- Types ---
 type Coordinates = {
@@ -99,8 +103,12 @@ const convertTemp = (celsius: number, system: UnitSystem): string => {
 
 const formatTime = (isoString: string) => {
   if (!isoString) return "--:--";
-  const date = new Date(isoString);
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  try {
+    const date = new Date(isoString);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  } catch (e) {
+    return "--:--";
+  }
 };
 
 const getWeatherInfo = (code: number) => {
@@ -176,30 +184,46 @@ const generateGPX = (points: GeoPoint[]) => {
 
 // --- Hooks ---
 const useWakeLock = () => {
-  useEffect(() => {
-    let wakeLock: any = null;
-    const requestLock = async () => {
+  const wakeLockRef = useRef<any>(null);
+
+  const requestLock = useCallback(async () => {
+    try {
+      if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+        wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+      }
+    } catch (err) {
+      console.warn('Wake Lock request failed:', err);
+    }
+  }, []);
+
+  const releaseLock = useCallback(async () => {
+    if (wakeLockRef.current) {
       try {
-        if ('wakeLock' in navigator && document.visibilityState === 'visible') {
-          wakeLock = await (navigator as any).wakeLock.request('screen');
-        }
-      } catch (err) {}
-    };
+        await wakeLockRef.current.release();
+        wakeLockRef.current = null;
+      } catch (err) {
+        console.warn('Wake Lock release failed:', err);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
     requestLock();
+
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         requestLock();
-      } else if (wakeLock) {
-        wakeLock.release().catch(() => {});
-        wakeLock = null;
+      } else {
+        releaseLock();
       }
     };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
-      if (wakeLock) wakeLock.release().catch(() => {});
+      releaseLock();
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, []);
+  }, [requestLock, releaseLock]);
 };
 
 const useGeolocation = () => {
@@ -214,6 +238,7 @@ const useGeolocation = () => {
 
     const handleSuccess = ({ coords }: GeolocationPosition) => {
       const now = Date.now();
+      // Throttle updates slightly to reduce render churn
       if (now - lastUpdate.current < 200) return;
       if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
       lastUpdate.current = now;
@@ -223,7 +248,8 @@ const useGeolocation = () => {
             prev.coords.latitude === coords.latitude && 
             prev.coords.longitude === coords.longitude &&
             prev.coords.heading === coords.heading &&
-            prev.coords.speed === coords.speed) {
+            prev.coords.speed === coords.speed &&
+            prev.coords.accuracy === coords.accuracy) {
           return prev;
         }
         return {
@@ -246,7 +272,7 @@ const useGeolocation = () => {
       switch(error.code) {
         case error.PERMISSION_DENIED: errorMessage = "Location denied"; break;
         case error.POSITION_UNAVAILABLE: errorMessage = "Position unavailable"; break;
-        case error.TIMEOUT: return; 
+        case error.TIMEOUT: return; // Don't reset state on timeout, just wait
       }
       setState(s => ({ ...s, loading: false, error: errorMessage }));
     };
@@ -278,35 +304,38 @@ const useCompass = () => {
   const currentRollRef = useRef<number>(0);
 
   const rafIdRef = useRef<number | null>(null);
-  const isMounted = useRef(true);
+  const isRunningRef = useRef(false);
 
   useEffect(() => {
-    isMounted.current = true;
-    return () => { isMounted.current = false; };
+    isRunningRef.current = true;
+    return () => { isRunningRef.current = false; };
   }, []);
   
   useEffect(() => {
     if (!permissionGranted) return;
     
-    let isRunning = true;
     const loop = () => {
-      if (!isRunning || !isMounted.current) return;
+      if (!isRunningRef.current) return;
 
+      // Heading Smoothing
       const hDiff = targetHeadingRef.current - currentHeadingRef.current;
       if (Math.abs(hDiff) > 0.1) {
-          currentHeadingRef.current += hDiff * 0.15;
+          // Weighted averaging for smoothness
+          currentHeadingRef.current += hDiff * 0.1;
           setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
       } else if (currentHeadingRef.current !== targetHeadingRef.current) {
           currentHeadingRef.current = targetHeadingRef.current;
           setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
       }
 
+      // Pitch Smoothing
       const pDiff = targetPitchRef.current - currentPitchRef.current;
       if (Math.abs(pDiff) > 0.1) {
           currentPitchRef.current += pDiff * 0.1;
           setPitch(currentPitchRef.current);
       }
 
+      // Roll Smoothing
       const rDiff = targetRollRef.current - currentRollRef.current;
       if (Math.abs(rDiff) > 0.1) {
           currentRollRef.current += rDiff * 0.1;
@@ -318,7 +347,6 @@ const useCompass = () => {
 
     rafIdRef.current = requestAnimationFrame(loop);
     return () => { 
-      isRunning = false;
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); 
     };
   }, [permissionGranted]);
@@ -346,8 +374,10 @@ const useCompass = () => {
     const handleOrientation = (e: any) => {
       let degree: number | null = null;
       if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
+        // iOS
         degree = e.webkitCompassHeading;
       } else if (e.alpha !== null) {
+        // Android/Non-iOS
         degree = Math.abs(360 - e.alpha);
       }
 
@@ -358,6 +388,7 @@ const useCompass = () => {
         const currentMod = (current % 360 + 360) % 360;
         
         let delta = normalized - currentMod;
+        // Shortest path interpolation logic
         if (delta > 180) delta -= 360;
         if (delta < -180) delta += 360;
         targetHeadingRef.current = current + delta;
@@ -367,6 +398,7 @@ const useCompass = () => {
       if (e.gamma !== null) targetRollRef.current = e.gamma;
     };
 
+    // Prefer absolute orientation if available (more accurate on Android)
     const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
     window.addEventListener(eventName, handleOrientation, true);
     return () => window.removeEventListener(eventName, handleOrientation, true);
@@ -390,20 +422,11 @@ const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number
   const p = pitch || 0;
   const r = roll || 0;
   
-  const ladderLines = useMemo(() => {
-    const lines = [];
-    for (let i = -60; i <= 60; i += 10) {
-      if (i === 0) continue; 
-      lines.push(i);
-    }
-    return lines;
-  }, []);
-
   const visualP = Math.max(Math.min(p, 60), -60);
   const pxPerDeg = 2; 
 
   return (
-    <div className="relative w-40 h-40 shrink-0 rounded-full border-[6px] border-[#1a1a1a] bg-[#0c0c0c] overflow-hidden shadow-2xl ring-1 ring-white/10 group">
+    <div className="relative w-40 h-40 shrink-0 rounded-full border-[6px] border-[#1a1a1a] bg-[#0c0c0c] overflow-hidden shadow-2xl ring-1 ring-white/10 group select-none">
        {/* Outer Mechanical Bezel */}
        <div className="absolute inset-0 rounded-full border-2 border-white/5 pointer-events-none z-30" />
        
@@ -426,7 +449,7 @@ const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number
 
         {/* Pitch Ladder */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full h-full pointer-events-none">
-            {ladderLines.map(deg => (
+            {PITCH_LADDER_LINES.map(deg => (
                 <div 
                     key={deg} 
                     className="absolute left-1/2 -translate-x-1/2 flex items-center justify-center gap-2 w-full opacity-60"
@@ -440,20 +463,19 @@ const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number
         </div>
       </div>
 
-      {/* Fixed Aircraft Reference (The W) */}
+      {/* Fixed Aircraft Reference */}
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
         <div className="w-1.5 h-1.5 bg-yellow-400 rounded-full shadow-[0_0_4px_rgba(250,204,21,1)] z-10 border border-black/20" />
-        <div className="absolute w-16 h-8 border-b-2 border-yellow-400/80 rounded-[50%] -translate-y-2 opacity-0" /> {/* Subtle curve hint */}
         <div className="absolute flex gap-8">
              <div className="w-8 h-1 bg-yellow-400/80 rounded-full shadow-sm" />
              <div className="w-8 h-1 bg-yellow-400/80 rounded-full shadow-sm" />
         </div>
       </div>
       
-      {/* Banking Scale (Top) */}
+      {/* Banking Scale */}
       <div className="absolute top-2 inset-x-0 flex justify-center z-20 pointer-events-none">
            <div className="w-24 h-24 rounded-full border-t border-white/30 absolute top-0 mask-image-gradient" />
-           {[ -30, -20, -10, 10, 20, 30].map(deg => (
+           {BANKING_SCALE_TICKS.map(deg => (
                <div key={deg} className="absolute top-0 h-2 w-px bg-white/40 origin-bottom" style={{ transform: `rotate(${deg}deg) translateY(2px)`, transformOrigin: 'center 68px' }} />
            ))}
       </div>
@@ -657,7 +679,7 @@ RadarMapbox.displayName = "RadarMapbox";
 const CompassTicks = memo(() => (
   <>
     <circle cx="50" cy="50" r="46" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/20 fill-none" />
-    {[...Array(72)].map((_, i) => {
+    {COMPASS_TICKS.map((_, i) => {
       const isCardinal = i % 18 === 0;
       const isMajor = i % 6 === 0;
       const length = isCardinal ? 6 : isMajor ? 3 : 1.5;
@@ -1024,7 +1046,7 @@ const FullMapDrawer = memo(({
         </div>
 
         <div 
-           className="relative flex-1 w-full h-full overflow-hidden bg-[#111]"
+           className="relative flex-1 w-full h-full overflow-hidden bg-[#111] touch-none"
            ref={mapContainer}
         >
            <div className="absolute inset-0 flex items-center justify-center -z-10">
@@ -1036,7 +1058,7 @@ const FullMapDrawer = memo(({
            />
         </div>
 
-        <div className="absolute right-4 top-1/2 -translate-x-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
+        <div className="absolute right-4 top-1/2 -translate-y-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
              <div className="pointer-events-auto flex flex-col gap-2 bg-black/40 backdrop-blur-md p-1.5 rounded-2xl border border-white/10">
                  <button onClick={zoomIn} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Plus className="w-5 h-5"/></button>
                  <button onClick={resetView} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors text-[10px] font-bold font-mono">{Math.round(zoomLevel)}z</button>
