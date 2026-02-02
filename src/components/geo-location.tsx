@@ -6,8 +6,9 @@ import {
   AlertCircle, Mountain, Activity, Navigation, MapPin, Loader2,
   Trash2, Crosshair, Compass as CompassIcon, WifiOff,
   Maximize2, X, LocateFixed, Circle, Download, Sunrise, Sunset, Moon, Wind,
-  Share2, Signal, Plus, Minus, Copy, Check, RotateCw, Layers, Scan,
-  ArrowUp, Hand, Video, VideoOff, Eye, Zap, Aperture, Target, Upload, Image as ImageIcon
+  Share2, Signal, Plus, Minus, Copy, Check, Layers, Scan,
+  ArrowUp, Hand, Video, VideoOff, Aperture, Upload, Target, EyeOff,
+  Headphones, Mic, Volume2, Globe, Box, Eye
 } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
@@ -26,11 +27,10 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 const MAPBOX_TOKEN = "pk.eyJ1Ijoib3BlbnN0cmVldGNhbSIsImEiOiJja252Ymh4ZnIwNHdkMnd0ZzF5NDVmdnR5In0.dYxz3TzZPTPzd_ibMeGK2g";
 mapboxgl.accessToken = MAPBOX_TOKEN;
 
-const RADAR_ZOOM = 18;
+const RADAR_ZOOM = 16; // Reduced slightly to ensure static tile availability
 const TRAIL_MAX_POINTS = 100; 
 const TRAIL_MIN_DISTANCE = 5; 
 const MAP_UPDATE_THRESHOLD = 80; 
-const API_FETCH_DISTANCE_THRESHOLD = 2.0; 
 const REC_MIN_DISTANCE = 5; 
 const GPS_HEADING_THRESHOLD = 1.0; 
 
@@ -67,8 +67,14 @@ type WeatherData = {
 
 type GeoPoint = { lat: number; lng: number; alt: number | null; timestamp: number };
 type UnitSystem = 'metric' | 'imperial';
-type MapMode = 'heading-up' | 'north-up';
-type MapStyle = 'satellite' | 'dark';
+type MapMode = '2d' | '3d';
+type NorthRef = 'heading-up' | 'north-up';
+
+interface TargetData {
+    lat: number;
+    lng: number;
+    active: boolean;
+}
 
 interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
   webkitCompassHeading?: number;
@@ -78,7 +84,7 @@ interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
 // --- Helpers ---
 const triggerHaptic = () => {
   if (typeof navigator !== 'undefined' && navigator.vibrate) {
-    navigator.vibrate(20);
+    navigator.vibrate(15);
   }
 };
 
@@ -101,14 +107,12 @@ const convertTemp = (celsius: number, system: UnitSystem): string => {
   return system === 'metric' ? `${celsius.toFixed(1)}°` : `${((celsius * 9/5) + 32).toFixed(1)}°`;
 };
 
-const formatTime = (isoString: string) => {
-  if (!isoString) return "--:--";
-  try {
-    const date = new Date(isoString);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-  } catch (e) {
-    return "--:--";
-  }
+const convertDistance = (meters: number, system: UnitSystem): string => {
+    if (system === 'metric') {
+        return meters >= 1000 ? `${(meters/1000).toFixed(2)}km` : `${Math.round(meters)}m`;
+    }
+    const feet = meters * 3.28084;
+    return feet >= 5280 ? `${(feet/5280).toFixed(2)}mi` : `${Math.round(feet)}ft`;
 };
 
 const getWeatherInfo = (code: number) => {
@@ -122,12 +126,6 @@ const getWeatherInfo = (code: number) => {
   return { label: "Overcast", icon: Cloud };
 };
 
-const getCompassDirection = (degree: number) => {
-  const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-  const normalized = ((degree % 360) + 360) % 360;
-  return directions[Math.round(normalized / 45) % 8];
-};
-
 const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
   const R = 6371e3; 
   const φ1 = lat1 * Math.PI / 180;
@@ -139,13 +137,18 @@ const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => 
   return R * c;
 };
 
-const calculateTotalDistance = (points: GeoPoint[]) => {
-  if (points.length < 2) return 0;
-  let total = 0;
-  for (let i = 0; i < points.length - 1; i++) {
-    total += getDistance(points[i].lat, points[i].lng, points[i+1].lat, points[i+1].lng);
-  }
-  return total;
+const getBearing = (startLat: number, startLng: number, destLat: number, destLng: number) => {
+    const startLatRad = startLat * (Math.PI / 180);
+    const startLngRad = startLng * (Math.PI / 180);
+    const destLatRad = destLat * (Math.PI / 180);
+    const destLngRad = destLng * (Math.PI / 180);
+
+    const y = Math.sin(destLngRad - startLngRad) * Math.cos(destLatRad);
+    const x = Math.cos(startLatRad) * Math.sin(destLatRad) -
+              Math.sin(startLatRad) * Math.cos(destLatRad) * Math.cos(destLngRad - startLngRad);
+    let brng = Math.atan2(y, x);
+    brng = brng * (180 / Math.PI);
+    return (brng + 360) % 360;
 };
 
 const geoToPixels = (lat: number, lng: number, anchorLat: number, anchorLng: number, zoom: number) => {
@@ -182,480 +185,188 @@ const generateGPX = (points: GeoPoint[]) => {
   return header + body + footer;
 };
 
+const speak = (text: string) => {
+    if(typeof window === 'undefined' || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.1; u.pitch = 0.9;
+    window.speechSynthesis.speak(u);
+};
+
 // --- Hooks ---
 const useWakeLock = () => {
-  const wakeLockRef = useRef<any>(null);
-
-  const requestLock = useCallback(async () => {
-    try {
-      if ('wakeLock' in navigator && document.visibilityState === 'visible') {
-        wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
-      }
-    } catch (err) {}
-  }, []);
-
-  const releaseLock = useCallback(async () => {
-    if (wakeLockRef.current) {
-      try {
-        await wakeLockRef.current.release();
-        wakeLockRef.current = null;
-      } catch (err) {}
-    }
-  }, []);
-
   useEffect(() => {
-    requestLock();
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') requestLock();
-      else releaseLock();
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      releaseLock();
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, [requestLock, releaseLock]);
+    if(typeof window === 'undefined') return;
+    const request = async () => { try { if ('wakeLock' in navigator) await (navigator as any).wakeLock.request('screen'); } catch(e){} };
+    request();
+    const handleVis = () => document.visibilityState === 'visible' && request();
+    document.addEventListener('visibilitychange', handleVis);
+    return () => document.removeEventListener('visibilitychange', handleVis);
+  }, []);
 };
 
 const useGeolocation = () => {
   const [state, setState] = useState<GeoState>({ coords: null, error: null, loading: true });
-  const lastUpdate = useRef<number>(0);
-  const watchId = useRef<number | null>(null);
-
+  
   useEffect(() => {
     if (typeof window === 'undefined' || !navigator.geolocation) {
-      setState({ coords: null, loading: false, error: "Geolocation not supported" });
+      setState({ coords: null, loading: false, error: "Not Supported" });
       return;
     }
-
-    const startWatching = () => {
-      watchId.current = navigator.geolocation.watchPosition(
-        ({ coords }: GeolocationPosition) => {
-          const now = Date.now();
-          if (now - lastUpdate.current < 500) return;
-          if (isNaN(coords.latitude) || isNaN(coords.longitude)) return;
-          lastUpdate.current = now;
-
-          setState(prev => {
-            if (prev.coords && 
-                prev.coords.latitude === coords.latitude && 
-                prev.coords.longitude === coords.longitude &&
-                Math.abs((prev.coords.heading || 0) - (coords.heading || 0)) < 1) {
-              return prev;
-            }
-            return {
-              coords: {
-                latitude: coords.latitude,
-                longitude: coords.longitude,
-                accuracy: coords.accuracy,
-                altitude: coords.altitude,
-                speed: coords.speed,
-                heading: coords.heading,
-              }, 
-              error: null, 
-              loading: false,
-            };
-          });
-        }, 
-        (error) => {
-          if (error.code === error.TIMEOUT) return; 
-          setState(s => ({ ...s, loading: false, error: "Signal Lost" }));
-        }, 
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 1000 }
-      );
-    };
-
-    startWatching();
-    return () => { if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current); };
+    const id = navigator.geolocation.watchPosition(
+      ({ coords }) => {
+        // Simple smoothing could go here, but raw data is preferred for tactical apps
+        setState({
+            coords: {
+              latitude: coords.latitude,
+              longitude: coords.longitude,
+              accuracy: coords.accuracy,
+              altitude: coords.altitude,
+              speed: coords.speed,
+              heading: coords.heading,
+            }, 
+            error: null, 
+            loading: false,
+        });
+      }, 
+      (error) => {
+        if (error.code !== error.TIMEOUT) setState(s => ({ ...s, loading: false, error: "Signal Lost" }));
+      }, 
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+    );
+    return () => navigator.geolocation.clearWatch(id);
   }, []);
-
   return state;
 };
 
 const useCompass = () => {
-  const [visualHeading, setVisualHeading] = useState<number | null>(null);
-  const [trueHeading, setTrueHeading] = useState<number | null>(null);
-  const [pitch, setPitch] = useState<number>(0);
-  const [roll, setRoll] = useState<number>(0);
+  const [headingState, setHeadingState] = useState({ heading: 0, trueHeading: 0, pitch: 0, roll: 0 });
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
-  const targetHeadingRef = useRef<number>(0);
-  const currentHeadingRef = useRef<number>(0);
-  const targetPitchRef = useRef<number>(0);
-  const currentPitchRef = useRef<number>(0);
-  const targetRollRef = useRef<number>(0);
-  const currentRollRef = useRef<number>(0);
-  const rafIdRef = useRef<number | null>(null);
-  const isRunningRef = useRef(false);
-
-  useEffect(() => {
-    isRunningRef.current = true;
-    return () => { isRunningRef.current = false; };
-  }, []);
-  
-  useEffect(() => {
-    if (!permissionGranted) return;
-    
-    const loop = () => {
-      if (!isRunningRef.current) return;
-      
-      const hDiff = targetHeadingRef.current - currentHeadingRef.current;
-      if (Math.abs(hDiff) > 0.1) {
-          currentHeadingRef.current += hDiff * 0.15;
-          setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
-      } else if (currentHeadingRef.current !== targetHeadingRef.current) {
-          currentHeadingRef.current = targetHeadingRef.current;
-          setVisualHeading((currentHeadingRef.current % 360 + 360) % 360);
-      }
-
-      const pDiff = targetPitchRef.current - currentPitchRef.current;
-      if (Math.abs(pDiff) > 0.1) {
-          currentPitchRef.current += pDiff * 0.1;
-          setPitch(currentPitchRef.current);
-      }
-
-      const rDiff = targetRollRef.current - currentRollRef.current;
-      if (Math.abs(rDiff) > 0.1) {
-          currentRollRef.current += rDiff * 0.1;
-          setRoll(currentRollRef.current);
-      }
-      rafIdRef.current = requestAnimationFrame(loop);
-    };
-    rafIdRef.current = requestAnimationFrame(loop);
-    return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
-  }, [permissionGranted]);
+  const refs = useRef({
+      targetHeading: 0,
+      currentHeading: 0,
+      targetPitch: 0,
+      currentPitch: 0,
+      targetRoll: 0,
+      currentRoll: 0
+  });
 
   const requestAccess = useCallback(async () => {
     triggerHaptic();
-    if (typeof DeviceOrientationEvent === 'undefined') {
-      setError("Sensor not found");
-      return;
-    }
+    if (typeof DeviceOrientationEvent === 'undefined') { setError("No Sensor"); return; }
+    
+    // Check if permission is needed (iOS 13+)
     const isIOS = typeof (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission === 'function';
+    
     if (isIOS) {
       try {
         const response = await (DeviceOrientationEvent as unknown as DeviceOrientationEventiOS).requestPermission!();
-        if (response === 'granted') { setPermissionGranted(true); setError(null); } else { setError("Denied"); }
-      } catch (e) { setError("Not supported"); }
+        if (response === 'granted') { setPermissionGranted(true); setError(null); } 
+        else { setError("Denied"); }
+      } catch (e) { setError("Error"); }
     } else { 
-      setPermissionGranted(true); 
+        setPermissionGranted(true); 
     }
   }, []);
 
   useEffect(() => {
     if (!permissionGranted || typeof window === 'undefined') return;
+    
+    let rafId: number;
+    let lastTime = 0;
+
+    const loop = (time: number) => {
+      // Throttle React State updates to ~30fps to save battery, but keep math internal
+      if (time - lastTime > 32) { 
+          const r = refs.current;
+          let hDiff = r.targetHeading - r.currentHeading;
+          if (hDiff > 180) hDiff -= 360;
+          if (hDiff < -180) hDiff += 360;
+          
+          // Easing
+          r.currentHeading += hDiff * 0.15;
+          r.currentPitch += (r.targetPitch - r.currentPitch) * 0.1;
+          r.currentRoll += (r.targetRoll - r.currentRoll) * 0.1;
+
+          setHeadingState({
+              heading: (r.currentHeading + 360) % 360,
+              trueHeading: (r.targetHeading + 360) % 360,
+              pitch: r.currentPitch,
+              roll: r.currentRoll
+          });
+          lastTime = time;
+      }
+      rafId = requestAnimationFrame(loop);
+    };
+    rafId = requestAnimationFrame(loop);
+
     const handleOrientation = (e: any) => {
       let degree: number | null = null;
-      if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) degree = e.webkitCompassHeading;
-      else if (e.alpha !== null) degree = Math.abs(360 - e.alpha);
-
-      if (degree !== null) {
-        const normalized = ((degree) + 360) % 360;
-        setTrueHeading(normalized);
-        const current = targetHeadingRef.current;
-        const currentMod = (current % 360 + 360) % 360;
-        let delta = normalized - currentMod;
-        if (delta > 180) delta -= 360;
-        if (delta < -180) delta += 360;
-        targetHeadingRef.current = current + delta;
+      if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
+          degree = e.webkitCompassHeading;
+      } else if (e.alpha !== null) {
+          degree = Math.abs(360 - e.alpha);
       }
-      if (e.beta !== null) targetPitchRef.current = e.beta;
-      if (e.gamma !== null) targetRollRef.current = e.gamma;
+
+      if (degree !== null) { refs.current.targetHeading = degree; }
+      if (e.beta !== null) refs.current.targetPitch = e.beta;
+      if (e.gamma !== null) refs.current.targetRoll = e.gamma;
     };
+
+    // 'deviceorientationabsolute' is standard for Android for true north, 'deviceorientation' for iOS
     const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
     window.addEventListener(eventName, handleOrientation, true);
-    return () => window.removeEventListener(eventName, handleOrientation, true);
+    
+    return () => {
+        window.removeEventListener(eventName, handleOrientation, true);
+        cancelAnimationFrame(rafId);
+    };
   }, [permissionGranted]);
 
-  return { heading: visualHeading, trueHeading, pitch, roll, requestAccess, permissionGranted, error };
+  return { ...headingState, requestAccess, permissionGranted, error };
 };
-
-const useDebounce = <T,>(value: T, delay: number): T => {
-  const [debouncedValue, setDebouncedValue] = useState(value);
-  useEffect(() => {
-    const handler = setTimeout(() => setDebouncedValue(value), delay);
-    return () => clearTimeout(handler);
-  }, [value, delay]);
-  return debouncedValue;
-};
-
-// --- TACTICAL SCANNER (Object Detection + Upload) ---
-const TacticalScanner = memo(() => {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const imageRef = useRef<HTMLImageElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  
-  const [model, setModel] = useState<cocoSsd.ObjectDetection | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [imageFile, setImageFile] = useState<string | null>(null);
-  const isMountedRef = useRef(true);
-
-  // Load COCO-SSD
-  useEffect(() => {
-    isMountedRef.current = true;
-    const loadAI = async () => {
-      try {
-        await tf.ready();
-        await tf.setBackend('webgl');
-        const loadedModel = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-        if (isMountedRef.current) {
-          setModel(loadedModel);
-          setLoading(false);
-        }
-      } catch (err) {
-        console.error("Scanner Load Error", err);
-      }
-    };
-    loadAI();
-    return () => { isMountedRef.current = false; };
-  }, []);
-
-  // Helper to draw boxes
-  const drawPredictions = (predictions: cocoSsd.DetectedObject[], canvas: HTMLCanvasElement) => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    // Clear previous drawings
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.font = '14px "Courier New", monospace';
-    ctx.lineWidth = 2;
-
-    predictions.forEach(prediction => {
-      const [x, y, width, height] = prediction.bbox;
-      const label = prediction.class.toUpperCase();
-      const score = Math.round(prediction.score * 100);
-
-      // Draw Brackets (Tactical Style)
-      ctx.strokeStyle = '#22c55e'; // Green
-      ctx.fillStyle = '#22c55e';
-      
-      // Box
-      ctx.strokeRect(x, y, width, height);
-      
-      // Label BG
-      ctx.fillRect(x, y - 20, ctx.measureText(`${label} ${score}%`).width + 10, 20);
-      
-      // Text
-      ctx.fillStyle = '#000';
-      ctx.fillText(`${label} ${score}%`, x + 5, y - 5);
-    });
-  };
-
-  // Webcam Detection Loop
-  useEffect(() => {
-    if (!model || imageFile) return; // Stop loop if image uploaded
-    let rafId: number;
-    let timeoutId: NodeJS.Timeout;
-    const DETECTION_INTERVAL = 150; 
-
-    const detectWebcam = async () => {
-      if (!isMountedRef.current) return;
-      if (videoRef.current && videoRef.current.readyState === 4 && canvasRef.current) {
-        
-        const predictions = await model.detect(videoRef.current, 5, 0.5);
-
-        if (isMountedRef.current && canvasRef.current) {
-            // Sync canvas dimensions
-            canvasRef.current.width = videoRef.current.videoWidth;
-            canvasRef.current.height = videoRef.current.videoHeight;
-            drawPredictions(predictions, canvasRef.current);
-        }
-      }
-      
-      timeoutId = setTimeout(() => {
-        rafId = requestAnimationFrame(detectWebcam);
-      }, DETECTION_INTERVAL);
-    };
-
-    detectWebcam();
-    return () => { 
-      cancelAnimationFrame(rafId);
-      clearTimeout(timeoutId);
-    };
-  }, [model, imageFile]);
-
-  // Static Image Detection Trigger
-  const detectImage = async () => {
-    if (model && imageRef.current && canvasRef.current) {
-        const img = imageRef.current;
-        if (img.complete && img.naturalWidth !== 0) {
-             canvasRef.current.width = img.width;
-             canvasRef.current.height = img.height;
-             const predictions = await model.detect(img, 10, 0.3); // More objects, lower threshold for static images
-             drawPredictions(predictions, canvasRef.current);
-        }
-    }
-  };
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    triggerHaptic();
-    const file = e.target.files?.[0];
-    if (file) {
-        const url = URL.createObjectURL(file);
-        setImageFile(url);
-    }
-  };
-
-  const clearImage = () => {
-      triggerHaptic();
-      if (imageFile) URL.revokeObjectURL(imageFile);
-      setImageFile(null);
-      // Clear canvas immediately
-      if (canvasRef.current) {
-          const ctx = canvasRef.current.getContext('2d');
-          if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-      }
-  };
-
-  return (
-    <div className="absolute inset-0 z-50 bg-black flex flex-col">
-        {/* Media Container */}
-        <div className="relative flex-1 w-full h-full overflow-hidden bg-black/90 flex items-center justify-center">
-            
-            {imageFile ? (
-                <img 
-                    ref={imageRef}
-                    src={imageFile}
-                    alt="Analysis Target"
-                    className="max-w-full max-h-full object-contain"
-                    onLoad={detectImage}
-                />
-            ) : (
-                <Webcam
-                    ref={(webcam: any) => { videoRef.current = webcam?.video || null; }}
-                    className="absolute inset-0 w-full h-full object-cover"
-                    videoConstraints={{ facingMode: "environment" }}
-                    muted
-                />
-            )}
-
-            {/* HUD Overlay Canvas - Positioned absolute to cover the container, 
-                but width/height set dynamically by JS to match source */}
-            <canvas ref={canvasRef} className="absolute pointer-events-none" style={imageFile ? { position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', maxWidth: '100%', maxHeight: '100%' } : { width: '100%', height: '100%' }} />
-            
-            {/* Loading State */}
-            {loading && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-50">
-                <div className="flex flex-col items-center gap-4">
-                    <Loader2 className="w-12 h-12 text-green-500 animate-spin" />
-                    <span className="text-green-500 font-mono tracking-widest animate-pulse">LOADING OPTICS...</span>
-                </div>
-            </div>
-            )}
-
-            {/* Crosshair Overlay (Only for Webcam) */}
-            {!imageFile && (
-                <div className="absolute inset-0 pointer-events-none flex items-center justify-center opacity-30">
-                    <div className="w-64 h-64 border border-white/30 rounded-full flex items-center justify-center">
-                        <div className="w-1 h-2 bg-white/50" />
-                    </div>
-                    <div className="absolute w-full h-px bg-white/10" />
-                    <div className="absolute h-full w-px bg-white/10" />
-                </div>
-            )}
-        </div>
-
-        {/* UI Overlay Controls */}
-        <div className="absolute top-4 left-4 flex gap-2 z-[60]">
-            <div className="px-3 py-1 bg-green-500/20 border border-green-500/50 text-green-500 text-xs font-black tracking-widest rounded uppercase animate-pulse">
-                {imageFile ? "STATIC ANALYSIS" : "LIVE FEED"}
-            </div>
-        </div>
-
-        {/* Bottom Controls */}
-        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 z-[60]">
-            {/* Upload Button */}
-            <input 
-                type="file" 
-                ref={fileInputRef} 
-                className="hidden" 
-                accept="image/*" 
-                onChange={handleFileUpload} 
-            />
-            <button 
-                onClick={() => fileInputRef.current?.click()}
-                className="p-4 rounded-full bg-black/50 border border-green-500/50 text-green-500 backdrop-blur-md active:scale-95 transition-all hover:bg-green-900/20"
-                aria-label="Upload Image"
-            >
-                <Upload className="w-6 h-6" />
-            </button>
-
-            {/* Clear Image Button (Only visible if image loaded) */}
-            {imageFile && (
-                <button 
-                    onClick={clearImage}
-                    className="p-4 rounded-full bg-red-900/50 border border-red-500/50 text-white backdrop-blur-md active:scale-95 transition-all"
-                    aria-label="Clear Image"
-                >
-                    <Trash2 className="w-6 h-6" />
-                </button>
-            )}
-        </div>
-    </div>
-  );
-});
-TacticalScanner.displayName = "TacticalScanner";
 
 // --- GESTURE COMPONENT ---
-const GestureOps = memo(({ 
-  onToggleRecording, 
-  onToggleMapMode,
-  isRecording 
-}: { 
-  onToggleRecording: () => void, 
-  onToggleMapMode: () => void,
-  isRecording: boolean
-}) => {
+const GestureOps = memo(({ onToggleRecording, onToggleMapMode, isRecording }: { onToggleRecording: () => void, onToggleMapMode: () => void, isRecording: boolean }) => {
   const webcamRef = useRef<Webcam>(null);
   const [model, setModel] = useState<handpose.HandPose | null>(null);
   const [loading, setLoading] = useState(true);
   const [gestureState, setGestureState] = useState<'neutral' | 'pinch' | 'fist'>('neutral');
   const [debugMsg, setDebugMsg] = useState("AI Init...");
-  const isMountedRef = useRef(true);
-
+  
   useEffect(() => {
-    isMountedRef.current = true;
+    let active = true;
     const initTF = async () => {
       try {
         await tf.ready();
         await tf.setBackend('webgl');
-        tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
         const net = await handpose.load();
-        if (isMountedRef.current) {
-          setModel(net);
-          setLoading(false);
-          setDebugMsg("Ops Ready");
-        }
+        if (active) { setModel(net); setLoading(false); setDebugMsg("Ops Ready"); }
       } catch (e) {
-        console.error("AI Load Failed", e);
-        if (isMountedRef.current) setDebugMsg("AI Error");
+        if (active) setDebugMsg("AI Error");
       }
     };
     initTF();
-    return () => { isMountedRef.current = false; };
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
     if (!model) return;
     let rafId: number;
-    let timeoutId: NodeJS.Timeout;
     let lastActionTime = 0;
     let consecutivePinchFrames = 0;
     let consecutiveFistFrames = 0;
     const FRAMES_TO_TRIGGER = 3; 
     const ACTION_COOLDOWN = 1200; 
-    const DETECTION_INTERVAL = 150; 
 
     const loop = async () => {
-      if (!isMountedRef.current) return;
       if (webcamRef.current && webcamRef.current.video && webcamRef.current.video.readyState === 4) {
         const video = webcamRef.current.video;
         const hands = await model.estimateHands(video);
 
-        if (isMountedRef.current) {
-          if (hands.length > 0) {
+        if (hands.length > 0) {
             const landmarks = hands[0].landmarks;
             const thumbTip = landmarks[4];
             const indexTip = landmarks[8];
@@ -665,913 +376,675 @@ const GestureOps = memo(({
             const now = Date.now();
 
             if (pinchDist < 25) {
-              consecutivePinchFrames++;
-              consecutiveFistFrames = 0;
-              setGestureState('pinch');
-              if (consecutivePinchFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
-                triggerHaptic();
-                onToggleMapMode();
-                setDebugMsg("Map Toggled");
-                lastActionTime = now;
-                consecutivePinchFrames = 0;
-              }
-            } else if (fistDist < 30) {
-              consecutiveFistFrames++;
-              consecutivePinchFrames = 0;
-              setGestureState('fist');
-              if (consecutiveFistFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
-                triggerHaptic();
-                onToggleRecording();
-                setDebugMsg(isRecording ? "Rec Stopped" : "Rec Started");
-                lastActionTime = now;
+                consecutivePinchFrames++;
                 consecutiveFistFrames = 0;
-              }
+                setGestureState('pinch');
+                if (consecutivePinchFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
+                    triggerHaptic();
+                    onToggleMapMode();
+                    setDebugMsg("Map Toggled");
+                    lastActionTime = now;
+                    consecutivePinchFrames = 0;
+                }
+            } else if (fistDist < 30) {
+                consecutiveFistFrames++;
+                consecutivePinchFrames = 0;
+                setGestureState('fist');
+                if (consecutiveFistFrames >= FRAMES_TO_TRIGGER && now - lastActionTime > ACTION_COOLDOWN) {
+                    triggerHaptic();
+                    onToggleRecording();
+                    setDebugMsg(isRecording ? "Rec Stopped" : "Rec Started");
+                    lastActionTime = now;
+                    consecutiveFistFrames = 0;
+                }
             } else {
-              consecutivePinchFrames = 0;
-              consecutiveFistFrames = 0;
-              setGestureState('neutral');
-              setDebugMsg("Scanning...");
+                consecutivePinchFrames = 0;
+                consecutiveFistFrames = 0;
+                setGestureState('neutral');
+                setDebugMsg("Scanning...");
             }
-          } else {
+        } else {
             setGestureState('neutral');
-          }
         }
       }
-      timeoutId = setTimeout(() => { rafId = requestAnimationFrame(loop); }, DETECTION_INTERVAL);
+      rafId = requestAnimationFrame(loop);
     };
     loop();
-    return () => { cancelAnimationFrame(rafId); clearTimeout(timeoutId); };
+    return () => { cancelAnimationFrame(rafId); };
   }, [model, onToggleRecording, onToggleMapMode, isRecording]);
 
   return (
-    <div className="absolute top-20 right-4 w-28 h-36 bg-black/90 rounded-xl border border-green-500/30 overflow-hidden z-50 shadow-2xl backdrop-blur-md transition-all animate-in fade-in zoom-in duration-300">
-       <Webcam ref={webcamRef} className="absolute inset-0 w-full h-full object-cover opacity-50 grayscale" mirrored={true} videoConstraints={{ width: 160, height: 120, facingMode: "user" }} screenshotFormat="image/jpeg" />
+    <div className="absolute top-20 right-4 w-28 h-36 bg-black/90 rounded-xl border border-green-500/30 overflow-hidden z-50 shadow-2xl backdrop-blur-md">
+       <Webcam ref={webcamRef} className="absolute inset-0 w-full h-full object-cover opacity-50 grayscale" mirrored={true} videoConstraints={{ width: 160, height: 120, facingMode: "user" }} />
        <div className="absolute inset-0 flex flex-col items-center justify-between p-2 pointer-events-none">
           {loading ? (
             <div className="flex flex-col items-center justify-center h-full gap-2"><Loader2 className="w-6 h-6 animate-spin text-green-500" /><span className="text-[8px] font-mono text-green-500/80 animate-pulse">BOOTING AI</span></div>
           ) : (
              <div className="mt-8 transition-all duration-200">
                {gestureState === 'neutral' && <Hand className="w-8 h-8 text-white/40" />}
-               {gestureState === 'pinch' && <Scan className="w-8 h-8 text-green-400 animate-pulse drop-shadow-[0_0_8px_rgba(74,222,128,0.8)]" />}
-               {gestureState === 'fist' && <Circle className="w-8 h-8 text-red-500 fill-red-500/50 animate-pulse drop-shadow-[0_0_8px_rgba(239,68,68,0.8)]" />}
+               {gestureState === 'pinch' && <Scan className="w-8 h-8 text-green-400 animate-pulse" />}
+               {gestureState === 'fist' && <Circle className="w-8 h-8 text-red-500 fill-red-500/50 animate-pulse" />}
              </div>
           )}
           {!loading && <div className="w-full bg-black/80 backdrop-blur-md rounded text-[8px] font-mono text-center py-1 text-green-400 border-t border-green-500/20">{debugMsg}</div>}
        </div>
-       <div className="absolute top-0 left-0 w-2 h-2 border-l border-t border-green-500/50" />
-       <div className="absolute top-0 right-0 w-2 h-2 border-r border-t border-green-500/50" />
-       <div className="absolute bottom-0 left-0 w-2 h-2 border-l border-b border-green-500/50" />
-       <div className="absolute bottom-0 right-0 w-2 h-2 border-r border-b border-green-500/50" />
-       <div className="absolute top-1 right-1"><div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse shadow-[0_0_5px_#22c55e]" /></div>
     </div>
   );
 });
 GestureOps.displayName = "GestureOps";
 
-// --- UI Components ---
-const Inclinometer = memo(({ pitch, roll }: { pitch: number | null, roll: number | null }) => {
-  const p = pitch || 0;
-  const r = roll || 0;
-  const visualP = Math.max(Math.min(p, 60), -60);
-  const pxPerDeg = 2; 
+// --- TACTICAL SCANNER ---
+const TacticalScanner = memo(() => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [model, setModel] = useState<cocoSsd.ObjectDetection | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [imageFile, setImageFile] = useState<string | null>(null);
+  const requestRef = useRef<number | null>(null);
+  
+  useEffect(() => {
+    let active = true;
+    tf.ready().then(() => tf.setBackend('webgl')).then(() => cocoSsd.load({ base: 'lite_mobilenet_v2' })).then(loaded => {
+        if(active) { setModel(loaded); setLoading(false); }
+    }).catch(e => console.warn("AI Load Error", e));
+    return () => { active = false; };
+  }, []);
+
+  const detect = useCallback(async () => {
+    if (!model || !canvasRef.current || (videoRef.current?.readyState !== 4 && !imageFile)) return;
+    const src = imageFile ? document.getElementById('static-img') as HTMLImageElement : videoRef.current as HTMLVideoElement;
+    if(!src) return;
+
+    try {
+        const predictions = await model.detect(src, 5, 0.5);
+        const ctx = canvasRef.current.getContext('2d');
+        if (ctx) {
+            canvasRef.current.width = src.width || (src as HTMLVideoElement).videoWidth;
+            canvasRef.current.height = src.height || (src as HTMLVideoElement).videoHeight;
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            ctx.font = '12px "Courier New"';
+            ctx.lineWidth = 2;
+
+            predictions.forEach(p => {
+                const [x, y, w, h] = p.bbox;
+                ctx.strokeStyle = '#22c55e';
+                ctx.strokeRect(x, y, w, h);
+                ctx.fillStyle = '#22c55e';
+                const text = `${p.class.toUpperCase()} ${Math.round(p.score * 100)}%`;
+                const tw = ctx.measureText(text).width;
+                ctx.fillRect(x, y - 18, tw + 8, 18);
+                ctx.fillStyle = '#000';
+                ctx.fillText(text, x + 4, y - 5);
+            });
+        }
+    } catch(e) {} 
+    
+    if(!imageFile) requestRef.current = requestAnimationFrame(detect);
+  }, [model, imageFile]);
+
+  useEffect(() => {
+    if(model && !imageFile) requestRef.current = requestAnimationFrame(detect);
+    return () => { if(requestRef.current) cancelAnimationFrame(requestRef.current); };
+  }, [model, imageFile, detect]);
+
+  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+      if(e.target.files?.[0]) {
+          setImageFile(URL.createObjectURL(e.target.files[0]));
+          setTimeout(detect, 500); 
+      }
+  };
 
   return (
-    <div className="relative w-40 h-40 shrink-0 rounded-full border-[6px] border-[#1a1a1a] bg-[#0c0c0c] overflow-hidden shadow-2xl ring-1 ring-white/10 group select-none">
-       <div className="absolute inset-0 rounded-full border-2 border-white/5 pointer-events-none z-30" />
+    <div className="absolute inset-0 z-50 bg-black flex flex-col">
+        <div className="relative flex-1 w-full h-full bg-black/90 flex items-center justify-center overflow-hidden">
+            {imageFile ? (
+                <img id="static-img" src={imageFile} className="max-w-full max-h-full object-contain" onLoad={detect} alt="Target" />
+            ) : (
+                <Webcam ref={(r) => { if(r) videoRef.current = r.video; }} className="absolute inset-0 w-full h-full object-cover" videoConstraints={{ facingMode: "environment" }} muted />
+            )}
+            <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none w-full h-full object-contain" />
+            {loading && <div className="absolute inset-0 flex items-center justify-center bg-black/80"><Loader2 className="w-10 h-10 text-green-500 animate-spin" /></div>}
+            {!imageFile && (
+                <div className="absolute inset-0 pointer-events-none opacity-30 flex items-center justify-center"><div className="w-64 h-64 border border-white/30 rounded-full flex items-center justify-center"><div className="w-1 h-2 bg-white/50" /></div><div className="absolute w-full h-px bg-white/10" /><div className="absolute h-full w-px bg-white/10" /></div>
+            )}
+        </div>
+        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex gap-4 z-[60]">
+            <label className="p-4 rounded-full bg-black/60 border border-green-500/50 text-green-500 backdrop-blur-md active:scale-95"><Upload className="w-6 h-6" /><input type="file" className="hidden" accept="image/*" onChange={handleUpload} /></label>
+            {imageFile && <button onClick={() => { setImageFile(null); const ctx=canvasRef.current?.getContext('2d'); if(ctx) ctx.clearRect(0,0,1000,1000); }} className="p-4 rounded-full bg-red-900/50 border border-red-500 text-white"><Trash2 className="w-6 h-6" /></button>}
+        </div>
+    </div>
+  );
+});
+TacticalScanner.displayName = "TacticalScanner";
+
+// --- GHOST HUD (AR) ---
+const GhostHUD = memo(({ heading, pitch, roll, targetBearing, targetDist }: { heading: number, pitch: number, roll: number, targetBearing: number | null, targetDist: string | null }) => {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        
+        let frameId: number;
+        const ctx = canvas.getContext('2d');
+
+        const render = () => {
+            if (!ctx) return;
+            const w = canvas.width = window.innerWidth;
+            const h = canvas.height = window.innerHeight;
+            const cx = w / 2;
+            const cy = h / 2;
+            
+            // FOV Calculation: Mobile cameras usually have ~60 deg Horizontal FOV
+            const FOV = 60;
+            const pxPerDeg = w / FOV; 
+            const pitchPxPerDeg = h / 60; // Approximate vertical scale
+
+            ctx.clearRect(0, 0, w, h);
+            ctx.save();
+            
+            // Horizon Line - Rotate the world based on Roll
+            ctx.translate(cx, cy);
+            ctx.rotate(-roll * Math.PI / 180);
+            ctx.translate(0, pitch * pitchPxPerDeg); 
+            
+            // Horizon visuals
+            ctx.fillStyle = 'rgba(34, 197, 94, 0.05)';
+            ctx.fillRect(-w, 0, w*2, h*2); // Ground tint
+            ctx.strokeStyle = '#22c55e';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(-w, 0); ctx.lineTo(w, 0);
+            ctx.stroke();
+
+            // Pitch Ladder
+            ctx.font = '10px monospace';
+            ctx.fillStyle = '#22c55e';
+            ctx.textAlign = 'center';
+            PITCH_LADDER_LINES.forEach(deg => {
+                const y = -deg * pitchPxPerDeg;
+                if (y > -h/2 - 100 && y < h/2 + 100) {
+                    ctx.beginPath();
+                    ctx.moveTo(-50, y); ctx.lineTo(50, y); 
+                    ctx.moveTo(-50, y); ctx.lineTo(-50, y + (deg > 0 ? 5 : -5));
+                    ctx.moveTo(50, y); ctx.lineTo(50, y + (deg > 0 ? 5 : -5));
+                    ctx.stroke();
+                    ctx.fillText(Math.abs(deg).toString(), -65, y + 4);
+                    ctx.fillText(Math.abs(deg).toString(), 65, y + 4);
+                }
+            });
+
+            ctx.restore();
+
+            // Compass Strip (Top)
+            ctx.save();
+            const stripY = 60; // Padding from top
+            
+            ctx.fillStyle = '#ef4444';
+            ctx.beginPath();
+            ctx.moveTo(cx, stripY + 15); ctx.lineTo(cx - 6, stripY); ctx.lineTo(cx + 6, stripY);
+            ctx.fill();
+
+            ctx.strokeStyle = '#22c55e';
+            ctx.fillStyle = '#22c55e';
+            ctx.font = '12px monospace';
+            ctx.textAlign = 'center';
+
+            // Draw ~90 degrees of compass (FOV + buffer)
+            const viewRange = FOV + 20; 
+            for (let i = Math.floor(heading - viewRange/2); i <= heading + viewRange/2; i++) {
+                const norm = ((i % 360) + 360) % 360;
+                const x = cx + (i - heading) * pxPerDeg;
+                
+                if (norm % 10 === 0) {
+                    ctx.beginPath(); ctx.moveTo(x, stripY); ctx.lineTo(x, stripY - 10); ctx.stroke();
+                    let label = norm.toString();
+                    if (norm === 0) label = "N"; if (norm === 90) label = "E"; if (norm === 180) label = "S"; if (norm === 270) label = "W";
+                    ctx.fillText(label, x, stripY + 25);
+                } else if (norm % 5 === 0) {
+                    ctx.beginPath(); ctx.moveTo(x, stripY); ctx.lineTo(x, stripY - 5); ctx.stroke();
+                }
+            }
+
+            // Target Marker AR
+            if (targetBearing !== null) {
+                let diff = targetBearing - heading;
+                if (diff > 180) diff -= 360; 
+                if (diff < -180) diff += 360;
+                
+                // If target is within screen width (FOV)
+                if (Math.abs(diff) < (FOV / 2)) {
+                    const tx = cx + (diff * pxPerDeg);
+                    const ty = cy; // Center vertically for now (could use target Elevation if available)
+                    
+                    ctx.strokeStyle = '#3b82f6';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(tx - 25, ty - 25, 50, 50);
+                    
+                    // Crosshair inside box
+                    ctx.beginPath(); ctx.moveTo(tx-5, ty); ctx.lineTo(tx+5, ty); ctx.stroke();
+                    ctx.beginPath(); ctx.moveTo(tx, ty-5); ctx.lineTo(tx, ty+5); ctx.stroke();
+
+                    ctx.fillStyle = '#3b82f6';
+                    ctx.font = '10px monospace';
+                    ctx.fillText(`TGT: ${targetDist}`, tx, ty + 40);
+                } else {
+                    // Arrow at edge of screen indicating direction
+                    const edgeX = diff > 0 ? w - 20 : 20;
+                    ctx.fillStyle = '#3b82f6';
+                    ctx.beginPath();
+                    ctx.moveTo(edgeX, cy); 
+                    ctx.lineTo(edgeX + (diff>0?-10:10), cy - 10);
+                    ctx.lineTo(edgeX + (diff>0?-10:10), cy + 10);
+                    ctx.fill();
+                    
+                    ctx.textAlign = diff > 0 ? 'right' : 'left';
+                    ctx.fillText(`TGT`, edgeX + (diff>0?-15:15), cy);
+                }
+            }
+            ctx.restore();
+
+            frameId = requestAnimationFrame(render);
+        };
+        render();
+        return () => cancelAnimationFrame(frameId);
+    }, [heading, pitch, roll, targetBearing, targetDist]);
+
+    return <canvas ref={canvasRef} className="absolute inset-0 z-20 pointer-events-none" />;
+});
+GhostHUD.displayName = "GhostHUD";
+
+// --- UI COMPONENTS ---
+const Inclinometer = memo(({ pitch, roll }: { pitch: number, roll: number }) => (
+    <div className="relative w-40 h-40 shrink-0 rounded-full border-[6px] border-[#1a1a1a] bg-[#0c0c0c] overflow-hidden shadow-2xl ring-1 ring-white/10 select-none">
+       <div className="absolute inset-0 rounded-full border-2 border-white/5 z-30 pointer-events-none" />
        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-0.5 h-1.5 bg-yellow-500 z-40" />
-       <div className="absolute top-0.5 left-1/2 -translate-x-1/2 -translate-y-1/2 w-0 h-0 border-l-[4px] border-l-transparent border-r-[4px] border-r-transparent border-b-[6px] border-b-yellow-500 z-40" />
-      <div className="absolute inset-[-50%] will-change-transform origin-center" style={{ transform: `rotate(${-r}deg) translateY(${visualP * pxPerDeg}px)`, transition: 'transform 0.1s linear' }}>
-        <div className="w-full h-1/2 bg-[#0066cc]/30 border-b-2 border-white/80 shadow-[0_0_10px_rgba(255,255,255,0.2)]" /> 
-        <div className="w-full h-1/2 bg-[#663300]/40 border-t-2 border-white/80 shadow-[0_0_10px_rgba(255,255,255,0.2)]" /> 
-        <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-white/50" />
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full h-full pointer-events-none">
+      <div className="absolute inset-[-50%] will-change-transform origin-center" style={{ transform: `rotate(${-roll}deg) translateY(${Math.max(Math.min(pitch, 60), -60) * 2}px)` }}>
+        <div className="w-full h-1/2 bg-[#0066cc]/30 border-b-2 border-white/80" /> 
+        <div className="w-full h-1/2 bg-[#663300]/40 border-t-2 border-white/80" /> 
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full h-full">
             {PITCH_LADDER_LINES.map(deg => (
-                <div key={deg} className="absolute left-1/2 -translate-x-1/2 flex items-center justify-center gap-2 w-full opacity-60" style={{ top: `calc(50% - ${deg * pxPerDeg}px)` }}>
-                    <span className="text-[6px] font-mono font-bold text-white/90 w-3 text-right drop-shadow-md">{Math.abs(deg)}</span>
+                <div key={deg} className="absolute left-1/2 -translate-x-1/2 flex items-center justify-center gap-2 w-full opacity-60" style={{ top: `calc(50% - ${deg * 2}px)` }}>
                     <div className="h-px bg-white/80 w-6 shadow-[0_0_2px_black]" />
-                    <span className="text-[6px] font-mono font-bold text-white/90 w-3 text-left drop-shadow-md">{Math.abs(deg)}</span>
                 </div>
             ))}
         </div>
       </div>
-      <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
-        <div className="w-1.5 h-1.5 bg-yellow-400 rounded-full shadow-[0_0_4px_rgba(250,204,21,1)] z-10 border border-black/20" />
-        <div className="absolute flex gap-8">
-             <div className="w-8 h-1 bg-yellow-400/80 rounded-full shadow-sm" />
-             <div className="w-8 h-1 bg-yellow-400/80 rounded-full shadow-sm" />
-        </div>
+      <div className="absolute inset-0 flex items-center justify-center z-20"><div className="w-1.5 h-1.5 bg-yellow-400 rounded-full border border-black/20" /><div className="absolute flex gap-8"><div className="w-8 h-1 bg-yellow-400/80 rounded-full" /><div className="w-8 h-1 bg-yellow-400/80 rounded-full" /></div></div>
+      <div className="absolute top-2 inset-x-0 flex justify-center z-20">
+           {BANKING_SCALE_TICKS.map(deg => <div key={deg} className="absolute top-0 h-2 w-px bg-white/40 origin-bottom" style={{ transform: `rotate(${deg}deg) translateY(2px)`, transformOrigin: 'center 68px' }} />)}
       </div>
-      <div className="absolute top-2 inset-x-0 flex justify-center z-20 pointer-events-none">
-           <div className="w-24 h-24 rounded-full border-t border-white/30 absolute top-0 mask-image-gradient" />
-           {BANKING_SCALE_TICKS.map(deg => (
-               <div key={deg} className="absolute top-0 h-2 w-px bg-white/40 origin-bottom" style={{ transform: `rotate(${deg}deg) translateY(2px)`, transformOrigin: 'center 68px' }} />
-           ))}
-      </div>
-      <div className="absolute inset-0 rounded-full bg-gradient-to-br from-white/10 via-transparent to-black/40 pointer-events-none z-50" />
-      <div className="absolute bottom-3 inset-x-0 flex justify-between px-8 text-[7px] font-mono font-bold text-white/50 pointer-events-none z-40">
-        <div className="flex flex-col items-center bg-black/60 px-1.5 py-0.5 rounded border border-white/5">
-            <span className="text-[5px] uppercase tracking-wider text-white/40">Roll</span>
-            <span className="text-white tabular-nums">{r.toFixed(0)}°</span>
-        </div>
-        <div className="flex flex-col items-center bg-black/60 px-1.5 py-0.5 rounded border border-white/5">
-            <span className="text-[5px] uppercase tracking-wider text-white/40">Pitch</span>
-            <span className="text-white tabular-nums">{p.toFixed(0)}°</span>
-        </div>
+      <div className="absolute bottom-3 inset-x-0 flex justify-between px-8 text-[7px] font-mono font-bold text-white/50 z-40">
+        <span className="tabular-nums">{roll.toFixed(0)}°</span><span className="tabular-nums">{pitch.toFixed(0)}°</span>
       </div>
     </div>
-  );
-});
+));
 Inclinometer.displayName = "Inclinometer";
 
-const RadarMapbox = memo(({ 
-  path, 
-  heading, 
-  lat, 
-  lng,
-  mode,
-  accuracy,
-  zoom,
-  onRecenter,
-  onToggleMode
-}: { 
-  path: GeoPoint[], 
-  heading: number, 
-  lat: number, 
-  lng: number,
-  mode: MapMode,
-  accuracy: number | null,
-  zoom: number,
-  onRecenter: () => void,
-  onToggleMode: () => void
-}) => {
+const RadarMapbox = memo(({ path, heading, lat, lng, mode, accuracy, onRecenter, onToggleMode }: any) => {
   const [anchor, setAnchor] = useState({ lat, lng });
   const [isOffCenter, setIsOffCenter] = useState(false);
-  const [imgLoaded, setImgLoaded] = useState(false);
-  const [mapError, setMapError] = useState(false);
-  const [mapStyle, setMapStyle] = useState<MapStyle>('satellite');
+  const mapUrl = useMemo(() => `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/${anchor.lng},${anchor.lat},${RADAR_ZOOM},0,0/600x600@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, [anchor]);
 
   useEffect(() => {
-    const distance = getDistance(anchor.lat, anchor.lng, lat, lng);
-    setIsOffCenter(distance > 30); 
-    if (distance > MAP_UPDATE_THRESHOLD) {
-      setAnchor({ lat, lng });
-      setImgLoaded(false); 
-      setMapError(false);
-    }
+    const dist = getDistance(anchor.lat, anchor.lng, lat, lng);
+    setIsOffCenter(dist > 30);
+    if (dist > MAP_UPDATE_THRESHOLD) setAnchor({ lat, lng });
   }, [lat, lng, anchor]);
 
-  const styleId = mapStyle === 'satellite' ? 'satellite-streets-v12' : 'dark-v11';
-  const currentMapUrl = useMemo(() => 
-    `https://api.mapbox.com/styles/v1/mapbox/${styleId}/static/${anchor.lng},${anchor.lat},${zoom},0,0/600x600@2x?access_token=${MAPBOX_TOKEN}&logo=false&attribution=false`, 
-  [anchor.lat, anchor.lng, styleId, zoom]);
-
   const { userX, userY, svgPath } = useMemo(() => {
-    const userPos = geoToPixels(lat, lng, anchor.lat, anchor.lng, zoom);
-    let pathD = "";
-    if (path.length > 1) {
-      const points = path.map(p => {
-        const pt = geoToPixels(p.lat, p.lng, anchor.lat, anchor.lng, zoom);
+    const userPos = geoToPixels(lat, lng, anchor.lat, anchor.lng, RADAR_ZOOM);
+    const points = path.slice(-50).map((p: any) => { 
+        const pt = geoToPixels(p.lat, p.lng, anchor.lat, anchor.lng, RADAR_ZOOM);
         return `${pt.x},${pt.y}`;
-      });
-      pathD = "M " + points.join(" L ");
-    }
-    return { userX: userPos.x, userY: userPos.y, svgPath: pathD };
-  }, [lat, lng, anchor, path, zoom]);
+    });
+    return { userX: userPos.x, userY: userPos.y, svgPath: points.length > 1 ? "M " + points.join(" L ") : "" };
+  }, [lat, lng, anchor, path]);
 
   const rotation = mode === 'heading-up' ? heading : 0;
-  const markerRotation = mode === 'heading-up' ? 0 : heading;
-  
-  const accColor = !accuracy ? 'border-muted/20' 
-    : accuracy < 10 ? 'border-green-500/50' 
-    : accuracy < 30 ? 'border-yellow-500/50' 
-    : 'border-red-500/50';
-
-  const toggleStyle = useCallback(() => {
-      triggerHaptic();
-      setMapStyle(prev => prev === 'satellite' ? 'dark' : 'satellite');
-      setImgLoaded(false);
-  }, []);
-
   return (
-    <div className="relative w-64 h-64 md:w-72 md:h-72 shrink-0 select-none group flex flex-col items-center">
-      <div className="w-full h-full relative isolate rounded-full overflow-hidden border border-white/10 bg-black/80 shadow-2xl z-10">
-        <div className="absolute inset-0 rounded-full bg-black z-0" style={{ maskImage: 'radial-gradient(white, black)', transform: 'translateZ(0)' }}>
+    <div className="relative w-full h-full rounded-2xl overflow-hidden border border-white/10 shadow-2xl bg-[#0c0c0c]">
+      <div className="absolute inset-0 bg-black z-0">
           <div className="w-full h-full absolute inset-0 will-change-transform transition-transform duration-100 ease-linear origin-center" style={{ transform: `rotate(${-rotation}deg) scale(1.02)` }}>
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[220%] h-[220%]">
-               <div className="absolute inset-0 bg-[#0a0f0a]" />
-               {!mapError && (
-                 <img src={currentMapUrl} alt="Map View" onLoad={() => setImgLoaded(true)} onError={() => setMapError(true)} className={`w-full h-full object-contain transition-opacity duration-700 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`} style={{ filter: mapStyle === 'satellite' ? 'grayscale(0.3) contrast(1.1) brightness(0.9)' : 'contrast(1.2) brightness(0.8)' }} />
-               )}
-            </div>
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[220%] h-[220%]"><img src={mapUrl} className="w-full h-full object-contain filter grayscale-[0.3] contrast-125 brightness-90" alt="" /></div>
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] pointer-events-none z-10">
               <svg viewBox="-200 -200 400 400" className="w-full h-full overflow-visible">
-                {svgPath && <path d={svgPath} fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="opacity-60 drop-shadow-[0_0_8px_rgba(34,197,94,0.6)]" />}
-                <g transform={`translate(${userX}, ${userY})`}>
-                   <g transform={`rotate(${markerRotation})`}>
-                      <path d="M -6 -6 L 0 -18 L 6 -6" fill="rgba(34,197,94,0.9)" />
-                      <circle r="4" fill="#22c55e" className="animate-pulse" />
-                      <circle r="7" fill="none" stroke="#ffffff" strokeWidth="1.5" className="opacity-90" />
-                   </g>
+                {svgPath && <path d={svgPath} fill="none" stroke="#22c55e" strokeWidth="2.5" className="opacity-60" />}
+                <g transform={`translate(${userX}, ${userY}) rotate(${mode === 'heading-up' ? 0 : heading})`}>
+                   <path d="M -6 -6 L 0 -18 L 6 -6" fill="#22c55e" /><circle r="4" fill="#22c55e" className="animate-pulse" /><circle r="7" fill="none" stroke="#fff" strokeWidth="1.5" />
                 </g>
               </svg>
             </div>
           </div>
-        </div>
-        <div className="absolute inset-0 rounded-full border border-white/5 pointer-events-none z-20">
-            <div className="absolute inset-[25%] rounded-full border border-white/5" />
-            <div className="absolute inset-[50%] rounded-full border border-white/5" />
-        </div>
-        <div className={`absolute inset-0 rounded-full border-[3px] ${accColor} pointer-events-none z-10 opacity-40`} />
-        <div className="absolute inset-0 rounded-full pointer-events-none overflow-hidden z-20">
-             <div className="absolute inset-[-50%] bg-[conic-gradient(from_0deg,transparent_0deg,transparent_300deg,rgba(34,197,94,0.08)_360deg)] animate-[spin_4s_linear_infinite]" />
-        </div>
-        <div className="absolute inset-0 pointer-events-none z-30 opacity-30">
-           <div className="absolute top-1/2 left-0 w-full h-px bg-white/30" />
-           <div className="absolute left-1/2 top-0 h-full w-px bg-white/30" />
-           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-16 h-16 border border-white/20 rounded-full" />
-        </div>
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-none z-30" style={{ transform: `rotate(${-rotation}deg)`, transformOrigin: 'center 110px' }}>
-            <div className="text-[8px] font-black text-white bg-red-600 px-1 rounded-sm shadow-md">N</div>
-        </div>
       </div>
-      <div className="absolute -bottom-5 z-40 flex items-center gap-1 bg-[#111] p-1 rounded-full border border-white/10 shadow-xl backdrop-blur-md">
-            <button onClick={() => { triggerHaptic(); onToggleMode(); }} type="button" className={`text-[9px] font-bold px-3 py-1.5 rounded-full border transition-all ${mode === 'heading-up' ? 'bg-green-500/20 text-green-500 border-green-500/20' : 'bg-transparent text-muted-foreground border-transparent hover:text-white'}`}>
-              {mode === 'heading-up' ? 'HDG' : 'NTH'}
-            </button>
-            <div className="w-px h-3 bg-white/10" />
-            <button onClick={toggleStyle} type="button" className="p-1.5 rounded-full text-white/50 hover:text-white hover:bg-white/10 transition-colors">
-              <Layers className="w-3.5 h-3.5" />
-            </button>
-             {isOffCenter && (
-                 <>
-                    <div className="w-px h-3 bg-white/10" />
-                    <button onClick={() => { triggerHaptic(); onRecenter(); }} type="button" className="p-1.5 rounded-full text-blue-400 hover:bg-blue-500/10 transition-colors">
-                    <Crosshair className="w-3.5 h-3.5" />
-                    </button>
-                </>
-            )}
+      <div className="absolute bottom-4 right-4 z-40 flex flex-col gap-2">
+            <button onClick={onToggleMode} className={`p-3 rounded-full border transition-all bg-black/60 text-white backdrop-blur-md border-white/10`}>{mode === 'heading-up' ? <Navigation className="w-5 h-5"/> : <CompassIcon className="w-5 h-5"/>}</button>
+             {isOffCenter && <button onClick={onRecenter} className="p-3 rounded-full text-blue-400 bg-black/60 border border-white/10"><Crosshair className="w-5 h-5" /></button>}
       </div>
     </div>
   );
 });
 RadarMapbox.displayName = "RadarMapbox";
 
-const CompassTicks = memo(() => (
-  <>
-    <circle cx="50" cy="50" r="46" stroke="currentColor" strokeWidth="0.5" className="text-muted-foreground/20 fill-none" />
-    {COMPASS_TICKS.map((_, i) => {
-      const isCardinal = i % 18 === 0;
-      const isMajor = i % 6 === 0;
-      const length = isCardinal ? 6 : isMajor ? 3 : 1.5;
-      const width = isCardinal ? 1 : isMajor ? 0.5 : 0.25;
-      const colorClass = isCardinal ? "text-white" : isMajor ? "text-white/60" : "text-white/20";
-      return (
-        <line key={i} x1="50" y1="5" x2="50" y2={5 + length} transform={`rotate(${i * 5} 50 50)`} stroke="currentColor" strokeWidth={width} className={colorClass} strokeLinecap="square" />
-      );
-    })}
-  </>
-));
-CompassTicks.displayName = "CompassTicks";
+const Mapbox3D = memo(({ path, lat, lng, heading, target }: any) => {
+    const mapContainer = useRef<HTMLDivElement>(null);
+    const map = useRef<mapboxgl.Map | null>(null);
+    const marker = useRef<mapboxgl.Marker | null>(null);
 
-const CompassDisplay = memo(({ 
-  heading, 
-  trueHeading, 
-  onClick, 
-  hasError, 
-  permissionGranted,
-  source
-}: { 
-  heading: number | null, 
-  trueHeading: number | null, 
-  onClick: () => void, 
-  hasError: boolean, 
-  permissionGranted: boolean,
-  source: 'GPS' | 'MAG'
-}) => {
+    useEffect(() => {
+        if (!mapContainer.current || map.current) return;
+        
+        map.current = new mapboxgl.Map({
+            container: mapContainer.current,
+            style: 'mapbox://styles/mapbox/satellite-streets-v12',
+            center: [lng, lat],
+            zoom: 17,
+            pitch: 60, // 3D Tilt
+            bearing: heading,
+            attributionControl: false
+        });
+
+        map.current.on('load', () => {
+             map.current?.addSource('mapbox-dem', { 'type': 'raster-dem', 'url': 'mapbox://mapbox.mapbox-terrain-dem-v1', 'tileSize': 512, 'maxzoom': 14 });
+             map.current?.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': 1.5 });
+             map.current?.addLayer({ 'id': 'sky', 'type': 'sky', 'paint': { 'sky-type': 'atmosphere', 'sky-atmosphere-sun': [0.0, 0.0], 'sky-atmosphere-sun-intensity': 15 } });
+        });
+
+        const el = document.createElement('div');
+        el.className = 'marker';
+        el.innerHTML = '<div style="width:20px;height:20px;background:#22c55e;border:2px solid white;border-radius:50%;box-shadow:0 0 10px #22c55e;"></div>';
+        marker.current = new mapboxgl.Marker({ element: el }).setLngLat([lng, lat]).addTo(map.current);
+
+        return () => { 
+            // Proper cleanup to prevent context loss on toggle
+            map.current?.remove(); 
+            map.current = null; 
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!map.current) return;
+        if(marker.current) marker.current.setLngLat([lng, lat]);
+        map.current.easeTo({ center: [lng, lat], bearing: heading, duration: 1000 });
+    }, [lat, lng, heading]);
+
+    return <div ref={mapContainer} className="w-full h-full rounded-2xl overflow-hidden border border-white/10 shadow-2xl" />;
+});
+Mapbox3D.displayName = "Mapbox3D";
+
+const CompassDisplay = memo(({ heading, trueHeading, onClick, hasError, permissionGranted, source, targetBearing }: any) => {
   const rotation = heading || 0;
-  const directionStr = trueHeading !== null ? getCompassDirection(trueHeading) : "--";
   const displayHeading = trueHeading !== null ? Math.round(trueHeading) : 0;
-
+  
   return (
     <div className="flex flex-col items-center justify-center relative z-10 shrink-0">
-      <div 
-        className="relative w-64 h-64 md:w-72 md:h-72 cursor-pointer group select-none touch-manipulation transition-all duration-300" 
-        onClick={onClick}
-        role="button"
-        aria-label="Calibrate Compass"
-      >
+      <div className="relative w-64 h-64 md:w-72 md:h-72 cursor-pointer touch-manipulation transition-all duration-300" onClick={onClick}>
         <div className="absolute inset-0 rounded-full border-[10px] border-[#0c0c0c] bg-[#111] shadow-2xl flex items-center justify-center ring-1 ring-white/10">
              <div className="absolute top-1 text-[10px] font-black text-red-500">N</div>
              <div className="absolute right-2 text-[10px] font-black text-white/30">E</div>
              <div className="absolute bottom-2 text-[10px] font-black text-white/30">S</div>
              <div className="absolute left-2 text-[10px] font-black text-white/30">W</div>
-             <div className="absolute top-0 -translate-y-1 w-0 h-0 border-l-[8px] border-l-transparent border-r-[8px] border-r-transparent border-t-[10px] border-t-red-600 drop-shadow-[0_4px_4px_rgba(0,0,0,0.5)] z-20" />
+             <div className="absolute top-0 -translate-y-1 w-0 h-0 border-l-[8px] border-l-transparent border-r-[8px] border-r-transparent border-t-[10px] border-t-red-600 z-20" />
         </div>
         <div className="absolute inset-4 will-change-transform transition-transform duration-100 ease-linear rounded-full bg-[radial-gradient(circle,rgba(30,30,30,1)_0%,rgba(10,10,10,1)_100%)] border border-white/5" style={{ transform: `rotate(${-rotation}deg)` }}>
-          <svg viewBox="0 0 100 100" className="w-full h-full select-none pointer-events-none p-1">
-            <CompassTicks />
-          </svg>
+          <svg viewBox="0 0 100 100" className="w-full h-full p-1"><circle cx="50" cy="50" r="46" stroke="currentColor" strokeWidth="0.5" className="text-white/10 fill-none" />{COMPASS_TICKS.map((_, i) => <line key={i} x1="50" y1="5" x2="50" y2={i%6===0?8:6.5} transform={`rotate(${i*5} 50 50)`} stroke="currentColor" strokeWidth={i%18===0?1:0.5} className={i%18===0?"text-white":"text-white/30"} />)}</svg>
+          {targetBearing !== null && (
+              <div className="absolute inset-0 pointer-events-none" style={{ transform: `rotate(${targetBearing}deg)` }}>
+                  <div className="absolute top-2 left-1/2 -translate-x-1/2 w-3 h-3 bg-blue-500 border-2 border-white rotate-45 shadow-[0_0_10px_#3b82f6]" />
+              </div>
+          )}
         </div>
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center z-20 pointer-events-none">
-             <span className="text-5xl font-mono font-black tracking-tighter text-white tabular-nums drop-shadow-lg">
-                {permissionGranted || source === 'GPS' ? `${displayHeading}°` : "--"}
-             </span>
-             <div className="flex items-center gap-1 mt-1">
-                 <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border uppercase tracking-wider ${source === 'GPS' ? 'text-green-500 border-green-500/20 bg-green-500/5' : 'text-blue-500 border-blue-500/20 bg-blue-500/5'}`}>
-                 {source}
-                 </span>
-                 <span className="text-[9px] font-bold text-white/50 tracking-widest uppercase bg-white/5 px-2 py-0.5 rounded-full border border-white/10">
-                    {permissionGranted || source === 'GPS' ? directionStr : "---"}
-                 </span>
-             </div>
+             <span className="text-5xl font-mono font-black tracking-tighter text-white tabular-nums">{permissionGranted || source === 'GPS' ? `${displayHeading}°` : "--"}</span>
+             <div className="flex items-center gap-1 mt-1"><span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border uppercase ${source === 'GPS' ? 'text-green-500 border-green-500/20' : 'text-blue-500 border-blue-500/20'}`}>{source}</span></div>
         </div>
-        {!permissionGranted && !hasError && source === 'MAG' && (
-          <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-black/60 backdrop-blur-sm">
-            <button type="button" className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-white animate-pulse bg-blue-600/20 px-4 py-2 rounded-full border border-blue-500/50 shadow-xl hover:bg-blue-600/30 transition-colors">
-              <CompassIcon className="w-3 h-3" /> Align
-            </button>
-          </div>
-        )}
-        {hasError && (
-          <div className="absolute inset-0 flex items-center justify-center z-30 bg-background/50 backdrop-blur-sm rounded-full">
-            <WifiOff className="w-8 h-8 text-destructive/80" />
-          </div>
-        )}
+        {!permissionGranted && !hasError && source === 'MAG' && <div className="absolute inset-0 flex items-center justify-center rounded-full z-30 bg-black/60 backdrop-blur-sm"><span className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-white animate-pulse border border-white/20 px-3 py-1 rounded-full"><CompassIcon className="w-3 h-3" /> Tap Align</span></div>}
       </div>
     </div>
   );
 });
 CompassDisplay.displayName = "CompassDisplay";
 
-const DataCard = memo(({ children, className }: { children: React.ReactNode, className?: string }) => (
-    <div className={`relative p-4 rounded-xl bg-[#111]/60 border border-white/5 backdrop-blur-md overflow-hidden ${className}`}>
-        <div className="absolute top-0 left-0 w-2 h-2 border-l border-t border-white/20" />
-        <div className="absolute top-0 right-0 w-2 h-2 border-r border-t border-white/20" />
-        <div className="absolute bottom-0 left-0 w-2 h-2 border-l border-b border-white/20" />
-        <div className="absolute bottom-0 right-0 w-2 h-2 border-r border-b border-white/20" />
-        {children}
-    </div>
-));
-DataCard.displayName = "DataCard";
-
-const StatCard = memo(({ icon: Icon, label, value, subValue, unit }: { icon: any, label: string, value: string, subValue?: string, unit?: string }) => (
-  <DataCard className="flex flex-col items-start justify-between min-w-[90px] h-full shadow-lg group hover:border-white/10 transition-colors">
-    <div className="flex w-full items-center justify-between mb-2 opacity-60">
-      <span className="text-[9px] uppercase tracking-widest font-bold text-muted-foreground group-hover:text-white transition-colors">{label}</span>
-      <Icon className="w-3 h-3 text-white/50" />
-    </div>
-    <div className="flex flex-col items-baseline">
-      <div className="flex items-baseline gap-0.5">
-         <span className="text-xl font-mono font-bold text-foreground tracking-tight tabular-nums leading-none">{value}</span>
-         {unit && <span className="text-[10px] font-medium text-muted-foreground ml-0.5">{unit}</span>}
-      </div>
-      {subValue && <span className="text-[9px] text-muted-foreground font-medium mt-1">{subValue}</span>}
-    </div>
-  </DataCard>
+const StatCard = memo(({ icon: Icon, label, value, subValue, unit }: any) => (
+  <div className="relative p-3 rounded-xl bg-[#111]/60 border border-white/5 backdrop-blur-md flex flex-col items-start justify-between min-w-[90px] h-full shadow-lg">
+    <div className="flex w-full items-center justify-between mb-1 opacity-60"><span className="text-[9px] uppercase tracking-widest font-bold text-muted-foreground">{label}</span><Icon className="w-3 h-3 text-white/50" /></div>
+    <div className="flex flex-col items-baseline"><div className="flex items-baseline gap-0.5"><span className="text-xl font-mono font-bold text-foreground tabular-nums leading-none">{value}</span>{unit && <span className="text-[10px] font-medium text-muted-foreground ml-0.5">{unit}</span>}</div>{subValue && <span className="text-[9px] text-muted-foreground font-medium mt-1">{subValue}</span>}</div>
+  </div>
 ));
 StatCard.displayName = "StatCard";
 
-const SolarCard = memo(({ sunrise, sunset }: { sunrise: string[], sunset: string[] }) => {
-  const now = new Date().getTime();
-  const riseToday = new Date(sunrise[0]).getTime();
-  const setToday = new Date(sunset[0]).getTime();
-  const riseTomorrow = new Date(sunrise[1]).getTime();
-
-  let isDay = false;
-  let nextEventLabel = "Sunrise";
-  let nextEventTime = riseToday;
-  let progress = 0;
-
-  if (now < riseToday) {
-    isDay = false;
-    nextEventLabel = "Sunrise";
-    nextEventTime = riseToday;
-    const prevSunset = setToday - (24 * 3600 * 1000); 
-    const nightLength = riseToday - prevSunset;
-    progress = 100 - ((riseToday - now) / nightLength) * 100;
-  } else if (now >= riseToday && now < setToday) {
-    isDay = true;
-    nextEventLabel = "Sunset";
-    nextEventTime = setToday;
-    const dayLength = setToday - riseToday;
-    progress = ((now - riseToday) / dayLength) * 100;
-  } else {
-    isDay = false;
-    nextEventLabel = "Sunrise";
-    nextEventTime = riseTomorrow;
-    const nightLength = riseTomorrow - setToday;
-    progress = ((now - setToday) / nightLength) * 100;
-  }
-  progress = Math.min(Math.max(progress, 0), 100);
-
-  return (
-    <DataCard className="w-full space-y-3 shadow-lg">
-      <div className="flex items-center justify-between opacity-80">
-         <div className="flex items-center gap-2">
-            {isDay ? <Sun className="w-3.5 h-3.5 text-amber-400" /> : <Moon className="w-3.5 h-3.5 text-blue-300" />}
-            <span className="text-[9px] uppercase font-bold tracking-widest">{isDay ? "Daylight" : "Night Ops"}</span>
-         </div>
-         <span className="text-[10px] font-mono opacity-60">
-           {formatTime(new Date(nextEventTime).toISOString())} {nextEventLabel === "Sunset" ? "SET" : "RISE"}
-         </span>
-      </div>
-      <div className="relative w-full h-1.5 bg-black/60 rounded-full overflow-hidden border border-white/5">
-         <div className={`absolute top-0 bottom-0 left-0 shadow-[0_0_8px_rgba(255,255,255,0.4)] ${isDay ? 'bg-amber-500' : 'bg-blue-500'}`} style={{ width: `${progress}%`, transition: 'width 1s linear' }} />
-      </div>
-      <div className="flex justify-between text-[8px] font-mono text-muted-foreground uppercase">
-         <div className="flex items-center gap-1"><Sunrise className="w-3 h-3" /> {formatTime(sunrise[0])}</div>
-         <div className="flex items-center gap-1">{formatTime(sunset[0])} <Sunset className="w-3 h-3" /></div>
-      </div>
-    </DataCard>
-  );
-});
-SolarCard.displayName = "SolarCard";
-
-const CoordinateRow = memo(({ label, value, type }: { label: string; value: number; type: 'lat' | 'lng' }) => {
-  const formattedValue = useMemo(() => formatCoordinate(value, type), [value, type]);
-  const [copied, setCopied] = useState(false);
-  const handleCopy = async () => {
-    triggerHaptic();
-    if (!navigator.clipboard) return;
-    try { 
-      await navigator.clipboard.writeText(formattedValue); 
-      setCopied(true); 
-      setTimeout(() => setCopied(false), 2000); 
-    } catch (e) { console.error(e); }
-  };
-  
-  return (
-    <button className="group w-full flex items-center justify-between px-3 py-2.5 rounded-lg bg-black/20 hover:bg-white/5 border border-transparent hover:border-white/5 active:scale-[0.99] transition-all touch-manipulation" onClick={handleCopy} type="button">
-      <div className="flex flex-col items-start">
-         <span className={`text-[8px] uppercase tracking-widest font-bold transition-colors ${copied ? "text-green-500" : "text-muted-foreground"}`}>{copied ? "COPIED" : label}</span>
-         <span className="text-lg font-mono font-medium tracking-tight text-foreground tabular-nums mt-0.5">{formattedValue}</span>
-      </div>
-      <div className={`p-1.5 rounded-md transition-colors ${copied ? "bg-green-500/10 text-green-500" : "bg-transparent text-muted-foreground/30 group-hover:text-foreground"}`}>
-          {copied ? <div className="w-1.5 h-1.5 rounded-full bg-green-500" /> : <Maximize2 className="w-3 h-3" />}
-      </div>
-    </button>
-  );
-});
-CoordinateRow.displayName = "CoordinateRow";
-
-const FullMapDrawer = memo(({ isOpen, onClose, lat, lng }: { isOpen: boolean, onClose: () => void, lat: number, lng: number }) => {
-  const [copied, setCopied] = useState(false);
-  const mapContainer = useRef<HTMLDivElement>(null);
-  const map = useRef<mapboxgl.Map | null>(null);
-  const marker = useRef<mapboxgl.Marker | null>(null);
-  const [zoomLevel, setZoomLevel] = useState(16);
-
-  useEffect(() => {
-    if (!isOpen || !mapContainer.current || map.current) return; 
-
-    try {
-      map.current = new mapboxgl.Map({
-        container: mapContainer.current,
-        style: 'mapbox://styles/mapbox/satellite-streets-v12',
-        center: [lng, lat],
-        zoom: 16,
-        attributionControl: false
-      });
-      map.current.addControl(new mapboxgl.AttributionControl({ compact: true }), 'bottom-right');
-      const el = document.createElement('div');
-      el.className = 'marker';
-      el.innerHTML = `<div style="position: relative; width: 20px; height: 20px; display: flex; justify-content: center; align-items: center;"><div style="position: absolute; width: 100%; height: 100%; border-radius: 50%; background-color: rgba(34, 197, 94, 0.5); animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div><div style="width: 10px; height: 10px; background-color: #22c55e; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 10px rgba(34,197,94,0.8);"></div></div>`;
-      marker.current = new mapboxgl.Marker({ element: el }).setLngLat([lng, lat]).addTo(map.current);
-      map.current.on('zoom', () => { if(map.current) setZoomLevel(map.current.getZoom()); });
-    } catch (e) { console.error("Map initialization failed", e); }
-  }, [isOpen]);
-
-  useEffect(() => {
-    return () => { if (map.current) { map.current.remove(); map.current = null; } };
-  }, []);
-
-  useEffect(() => {
-    if (!map.current) return;
-    if (marker.current) marker.current.setLngLat([lng, lat]);
-    const currentCenter = map.current.getCenter();
-    const dist = getDistance(currentCenter.lat, currentCenter.lng, lat, lng);
-    if (dist > 100) map.current.flyTo({ center: [lng, lat], speed: 0.8 });
-  }, [lat, lng]);
-
-  useEffect(() => {
-    if (isOpen && map.current) {
-      setTimeout(() => { map.current?.resize(); map.current?.flyTo({ center: [lng, lat] }); }, 300); 
-    }
-  }, [isOpen]);
-
-  const handleCopy = () => {
-    if(navigator.clipboard) {
-       navigator.clipboard.writeText(`${lat}, ${lng}`);
-       setCopied(true);
-       setTimeout(() => setCopied(false), 2000);
-       triggerHaptic();
-    }
-  };
-  const zoomIn = () => { triggerHaptic(); map.current?.zoomIn(); };
-  const zoomOut = () => { triggerHaptic(); map.current?.zoomOut(); };
-  const resetView = () => { triggerHaptic(); map.current?.flyTo({ center: [lng, lat], zoom: 16, bearing: 0, pitch: 0 }); };
-
-  return (
-    <>
-      <div className={`fixed inset-0 bg-black/90 backdrop-blur-sm z-[60] transition-opacity duration-300 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} onClick={onClose} />
-      <div className={`fixed bottom-0 left-0 right-0 h-[92dvh] bg-[#0c0c0c] border-t border-white/10 rounded-t-[2rem] shadow-2xl z-[61] transition-transform duration-500 cubic-bezier(0.32, 0.72, 0, 1) flex flex-col ${isOpen ? 'translate-y-0' : 'translate-y-full'}`}>
-        <div className="absolute top-0 left-0 right-0 z-[65] p-6 pt-8 flex justify-between items-start pointer-events-none bg-gradient-to-b from-black/80 to-transparent">
-            <div className="pointer-events-auto space-y-1">
-                <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse shadow-[0_0_10px_#22c55e]" />
-                    <h3 className="text-xl font-black text-white tracking-widest uppercase font-mono">Sat<span className="text-white/40">.Link</span></h3>
-                </div>
-                <button onClick={handleCopy} className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 active:scale-95 transition-all group">
-                    <span className={`text-[10px] font-mono tracking-wider ${copied ? 'text-green-400' : 'text-white/60 group-hover:text-white'}`}>{lat.toFixed(6)}, {lng.toFixed(6)}</span>
-                    {copied ? <Check className="w-3 h-3 text-green-400"/> : <Copy className="w-3 h-3 text-white/40 group-hover:text-white"/>}
-                </button>
-            </div>
-            <button onClick={onClose} className="pointer-events-auto p-3 rounded-full bg-white/5 border border-white/10 text-white hover:bg-white/10 active:scale-90 transition-all backdrop-blur-md"><X className="w-5 h-5" /></button>
-        </div>
-        <div className="relative flex-1 w-full h-full overflow-hidden bg-[#111]" ref={mapContainer}>
-           <div className="absolute inset-0 flex items-center justify-center -z-10"><Loader2 className="w-8 h-8 animate-spin text-green-500/50" /></div>
-           <div className="absolute inset-0 pointer-events-none z-10 opacity-[0.05]" style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }} />
-        </div>
-        <div className="absolute right-4 top-1/2 -translate-x-1/2 z-[65] flex flex-col gap-4 pointer-events-none">
-             <div className="pointer-events-auto flex flex-col gap-2 bg-black/40 backdrop-blur-md p-1.5 rounded-2xl border border-white/10">
-                 <button onClick={zoomIn} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Plus className="w-5 h-5"/></button>
-                 <button onClick={resetView} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors text-[10px] font-bold font-mono">{Math.round(zoomLevel)}z</button>
-                 <button onClick={zoomOut} className="p-2.5 rounded-xl bg-white/5 hover:bg-white/20 text-white transition-colors"><Minus className="w-5 h-5"/></button>
-             </div>
-        </div>
-        <div className="absolute bottom-0 left-0 right-0 z-[65] p-6 bg-gradient-to-t from-black via-black/90 to-transparent">
-             <div className="grid grid-cols-2 gap-3 max-w-lg mx-auto">
-                 <button onClick={() => window.open(`http://maps.apple.com/?ll=${lat},${lng}&q=${lat},${lng}`, '_blank')} className="flex items-center justify-center gap-2 py-4 rounded-xl bg-white/10 hover:bg-white/20 border border-white/10 text-white font-bold text-xs uppercase tracking-wider backdrop-blur-md transition-all active:scale-[0.98]">
-                    <MapPin className="w-4 h-4" /> Apple Maps
-                 </button>
-                 <button onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${lat},${lng}`, '_blank')} className="flex items-center justify-center gap-2 py-4 rounded-xl bg-[#4285F4]/20 hover:bg-[#4285F4]/30 border border-[#4285F4]/30 text-[#4285F4] font-bold text-xs uppercase tracking-wider backdrop-blur-md transition-all active:scale-[0.98]">
-                    <LocateFixed className="w-4 h-4" /> Google Maps
-                 </button>
-             </div>
-        </div>
-      </div>
-    </>
-  );
-});
-FullMapDrawer.displayName = "FullMapDrawer";
-
 // --- MAIN COMPONENT ---
 export default function GeoLocation() {
+  const [mounted, setMounted] = useState(false);
+  
   const { coords, error, loading } = useGeolocation();
   const { heading, trueHeading, pitch, roll, requestAccess, permissionGranted, error: compassError } = useCompass();
   useWakeLock();
 
-  const [address, setAddress] = useState<string | null>(null);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [path, setPath] = useState<GeoPoint[]>([]);
   const [units, setUnits] = useState<UnitSystem>('metric');
-  const [mapMode, setMapMode] = useState<MapMode>('heading-up');
-  const [lastApiFetch, setLastApiFetch] = useState<{lat: number, lng: number} | null>(null);
-  const [mounted, setMounted] = useState(false);
-  const [isMapDrawerOpen, setIsMapDrawerOpen] = useState(false);
+  const [arMode, setArMode] = useState(false);
+  const [mapMode, setMapMode] = useState<MapMode>('2d');
+  const [audioEnabled, setAudioEnabled] = useState(false);
+  const [stealthMode, setStealthMode] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordedPath, setRecordedPath] = useState<GeoPoint[]>([]);
-  const [showSaveButton, setShowSaveButton] = useState(false);
+  const [isScannerMode, setIsScannerMode] = useState(false);
   const [isGestureMode, setIsGestureMode] = useState(false);
-  const [isScannerMode, setIsScannerMode] = useState(false); // New state for Scanner
+  const [target, setTarget] = useState<TargetData | null>(null);
+  const [northRef, setNorthRef] = useState<NorthRef>('heading-up');
   
-  const isMountedRef = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  useEffect(() => { 
-    isMountedRef.current = true;
-    setMounted(true); 
-    return () => { isMountedRef.current = false; };
-  }, []);
+  useEffect(() => { setMounted(true); }, []);
 
   const isMoving = (coords?.speed ?? 0) > GPS_HEADING_THRESHOLD;
-  const effectiveHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined ? coords.heading : (heading ?? 0);
-  const effectiveTrueHeading = isMoving && coords?.heading !== null && coords?.heading !== undefined ? coords.heading : trueHeading;
+  const effectiveHeading = isMoving && coords?.heading ? coords.heading : heading;
+  
+  const targetMetrics = useMemo(() => {
+      if (!coords || !target || !target.active) return null;
+      const dist = getDistance(coords.latitude, coords.longitude, target.lat, target.lng);
+      const bearing = getBearing(coords.latitude, coords.longitude, target.lat, target.lng);
+      return { dist, bearing };
+  }, [coords?.latitude, coords?.longitude, target]);
+
+  // Audio Ops Loop
+  useEffect(() => {
+      if (!audioEnabled || !targetMetrics) return;
+      const interval = setInterval(() => {
+          const dStr = convertDistance(targetMetrics.dist, units);
+          const bStr = Math.round(targetMetrics.bearing);
+          speak(`Target range ${dStr}, bearing ${bStr}`);
+      }, 15000); 
+      return () => clearInterval(interval);
+  }, [audioEnabled, targetMetrics, units]);
 
   useEffect(() => {
     if (!coords) return;
-    const newPoint = { lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() };
-
-    setPath(prev => {
-      if (prev.length === 0) return [newPoint];
-      const last = prev[prev.length - 1];
-      const distance = getDistance(last.lat, last.lng, coords.latitude, coords.longitude);
-      if (distance > TRAIL_MIN_DISTANCE) {
-        const newPath = [...prev, newPoint];
-        return newPath.length > TRAIL_MAX_POINTS ? newPath.slice(newPath.length - TRAIL_MAX_POINTS) : newPath;
-      }
-      return prev;
+    const pt = { lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() };
+    setPath(p => {
+        const last = p[p.length - 1];
+        if (!last || getDistance(last.lat, last.lng, pt.lat, pt.lng) > TRAIL_MIN_DISTANCE) {
+            return [...p, pt].slice(-TRAIL_MAX_POINTS);
+        }
+        return p;
     });
-
     if (isRecording) {
-      setRecordedPath(prev => {
-        if (prev.length === 0) return [newPoint];
-        const last = prev[prev.length - 1];
-        const dist = getDistance(last.lat, last.lng, newPoint.lat, newPoint.lng);
-        if (dist >= REC_MIN_DISTANCE) return [...prev, newPoint];
-        return prev;
-      });
+        setRecordedPath(p => {
+            const last = p[p.length - 1];
+            if (!last || getDistance(last.lat, last.lng, pt.lat, pt.lng) > REC_MIN_DISTANCE) return [...p, pt];
+            return p;
+        });
+    }
+
+    if(!weather) {
+         fetch(`https://api.open-meteo.com/v1/forecast?latitude=${coords.latitude}&longitude=${coords.longitude}&current=temperature_2m,weather_code,wind_speed_10m&daily=sunrise,sunset&forecast_days=1`)
+        .then(r => r.json()).then(d => setWeather({ temp: d.current.temperature_2m, code: d.current.weather_code, description: getWeatherInfo(d.current.weather_code).label, windSpeed: d.current.wind_speed_10m, windDir: 0, sunrise: d.daily.sunrise, sunset: d.daily.sunset })).catch(()=>{});
     }
   }, [coords, isRecording]);
 
-  const toggleRecording = useCallback(() => {
-    triggerHaptic();
-    if (isRecording) {
-      setIsRecording(false);
-      if (recordedPath.length > 0) setShowSaveButton(true);
-    } else {
-      setRecordedPath([]); 
-      setShowSaveButton(false);
-      setIsRecording(true);
-    }
-  }, [isRecording, recordedPath]);
-
-  const toggleScanner = useCallback(() => {
-    triggerHaptic();
-    setIsScannerMode(prev => !prev);
-    // Disable gestures if scanner is active (conflict)
-    if (!isScannerMode) setIsGestureMode(false);
-  }, [isScannerMode]);
-
-  const toggleGestures = useCallback(() => {
-    triggerHaptic();
-    setIsGestureMode(prev => !prev);
-    // Disable scanner if gestures active
-    if (!isGestureMode) setIsScannerMode(false);
-  }, [isGestureMode]);
-
-  const downloadGPX = useCallback(() => {
-    triggerHaptic();
-    if (recordedPath.length === 0) return;
-    const gpxString = generateGPX(recordedPath);
-    const blob = new Blob([gpxString], { type: 'application/gpx+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `mission-log-${new Date().toISOString().slice(0,19).replace(/:/g, '-')}.gpx`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    setShowSaveButton(false); 
-  }, [recordedPath]);
-
-  const handleShare = async () => {
-    triggerHaptic();
-    if (!coords) return;
-    const text = `Lat: ${coords.latitude.toFixed(6)}, Lng: ${coords.longitude.toFixed(6)}`;
-    const url = `https://www.google.com/maps?q=${coords.latitude},${coords.longitude}`;
-    if (navigator.share) {
-      try { await navigator.share({ title: 'My Location', text, url }); } catch (err) { console.error(err); }
-    } else {
-      navigator.clipboard.writeText(`${text}\n${url}`);
-    }
+  const handleSetTarget = () => {
+      triggerHaptic();
+      if (!coords) return;
+      if (target?.active) setTarget(null);
+      else setTarget({ lat: coords.latitude, lng: coords.longitude, active: true });
   };
 
-  const recenterMap = useCallback(() => { if (coords) setPath([{ lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() }]); }, [coords]);
-  const toggleUnits = useCallback(() => { triggerHaptic(); setUnits(prev => prev === 'metric' ? 'imperial' : 'metric'); }, []);
-  const toggleMapMode = useCallback(() => setMapMode(prev => prev === 'heading-up' ? 'north-up' : 'heading-up'), []);
-  const debouncedCoords = useDebounce(coords, 2000);
-
-  useEffect(() => {
-    if (!debouncedCoords) return;
-    if (lastApiFetch) {
-        const distKm = getDistance(lastApiFetch.lat, lastApiFetch.lng, debouncedCoords.latitude, debouncedCoords.longitude) / 1000;
-        if (distKm < API_FETCH_DISTANCE_THRESHOLD && address && weather) return;
-    }
-    
-    if (abortControllerRef.current) abortControllerRef.current.abort();
-    abortControllerRef.current = new AbortController();
-    
-    const fetchData = async () => {
-      try {
-        const { latitude, longitude } = debouncedCoords;
-        const signal = abortControllerRef.current?.signal;
-        const [geoRes, weatherRes] = await Promise.allSettled([
-          fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=14`, { signal }),
-          fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m&daily=sunrise,sunset&forecast_days=2&timezone=auto`, { signal })
-        ]);
-        
-        if (signal?.aborted || !isMountedRef.current) return;
-
-        if (geoRes.status === 'fulfilled' && geoRes.value.ok) {
-          try {
-            const data = await geoRes.value.json();
-            const addr = data.address;
-            if (addr) {
-              const location = [addr.city, addr.town, addr.village, addr.suburb].find(v => v) || "Wilderness";
-              setAddress(addr.country_code ? `${location}, ${addr.country_code.toUpperCase()}` : location);
-            }
-          } catch (e) {}
-        }
-
-        if (weatherRes.status === 'fulfilled' && weatherRes.value.ok) {
-          try {
-            const data = await weatherRes.value.json();
-            const info = getWeatherInfo(data.current.weather_code);
-            setWeather({ 
-              temp: data.current.temperature_2m, 
-              code: data.current.weather_code, 
-              description: info.label,
-              windSpeed: data.current.wind_speed_10m,
-              windDir: data.current.wind_direction_10m,
-              sunrise: data.daily.sunrise,
-              sunset: data.daily.sunset
-            });
-          } catch (e) {}
-        }
-        setLastApiFetch({ lat: latitude, lng: longitude });
-      } catch (err) {
-        if (err instanceof Error && err.name !== 'AbortError') console.error(err);
+  const handleManualTarget = () => {
+      const input = prompt("Enter Lat,Lng:");
+      if(input) {
+          const [lat, lng] = input.split(',').map(Number);
+          if(!isNaN(lat) && !isNaN(lng)) setTarget({ lat, lng, active: true });
       }
-    };
-    fetchData();
-  }, [debouncedCoords, lastApiFetch, address, weather]);
+  };
 
-  const WeatherIcon = weather ? getWeatherInfo(weather.code).icon : Sun;
-  const recordedDistance = useMemo(() => {
-     if (!isRecording && recordedPath.length === 0) return 0;
-     const dist = calculateTotalDistance(recordedPath);
-     return units === 'metric' ? dist : dist * 3.28084;
-  }, [recordedPath, isRecording, units]);
+  const downloadGPX = () => {
+    const blob = new Blob([generateGPX(recordedPath)], { type: 'application/gpx+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = `mission-${Date.now()}.gpx`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setRecordedPath([]); setIsRecording(false);
+  };
 
-  if (!mounted) return null;
+  const handleAudioToggle = () => {
+      triggerHaptic();
+      if(!audioEnabled) speak("Voice Ops Online");
+      setAudioEnabled(!audioEnabled);
+  };
+
+  if (!mounted) return <div className="min-h-screen bg-black" />;
 
   return (
-    <main className="relative flex flex-col items-center min-h-[100dvh] w-full bg-[#050505] text-foreground p-4 md:p-8 overflow-x-hidden touch-manipulation font-sans selection:bg-green-500/30 pb-32">
-      <div className="absolute inset-0 pointer-events-none z-0">
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(34,197,94,0.08),transparent_50%)]" />
-          <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:40px_40px] opacity-20" />
-      </div>
+    <main className={`relative flex flex-col items-center min-h-[100dvh] w-full bg-[#050505] text-foreground p-4 overflow-x-hidden font-sans pb-32 ${stealthMode ? 'brightness-75 contrast-125 sepia hue-rotate-[-50deg] saturate-[3]' : ''} ${arMode ? 'overflow-hidden' : ''}`}>
+      {/* Background/AR Layer */}
+      {arMode ? (
+          <div className="fixed inset-0 z-0">
+             <Webcam className="absolute inset-0 w-full h-full object-cover" videoConstraints={{ facingMode: "environment" }} muted />
+             <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/40" />
+             <GhostHUD heading={effectiveHeading} pitch={pitch} roll={roll} targetBearing={targetMetrics?.bearing ?? null} targetDist={targetMetrics ? convertDistance(targetMetrics.dist, units) : null} />
+          </div>
+      ) : (
+          <div className="absolute inset-0 pointer-events-none z-0 bg-[radial-gradient(circle_at_top,rgba(34,197,94,0.05),transparent_60%)]" />
+      )}
 
-      <div className="w-full max-w-5xl flex justify-between items-center z-40 mb-8 shrink-0">
+      {/* Header */}
+      <div className={`w-full max-w-5xl flex justify-between items-center z-40 mb-6 shrink-0 backdrop-blur-sm p-2 rounded-xl border border-white/5 transition-all ${arMode ? "bg-black/40" : ""}`}>
          <div className="flex flex-col">
-             <div className="flex items-center gap-2">
-                 <Scan className="w-4 h-4 text-green-500" />
-                 <h1 className="text-sm font-black tracking-[0.2em] text-white/80 uppercase">Field<span className="text-white/30">Nav</span></h1>
-             </div>
-             <div className="flex items-center gap-1.5 mt-1 ml-0.5">
-                 <div className={`w-1.5 h-1.5 rounded-full ${coords ? "bg-green-500 shadow-[0_0_5px_#22c55e]" : "bg-red-500"}`} />
-                 <span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">{coords ? "Online" : "Searching"}</span>
-             </div>
+             <div className="flex items-center gap-2"><Scan className="w-4 h-4 text-green-500" /><h1 className="text-sm font-black tracking-[0.2em] text-white/80 uppercase">Field<span className="text-white/30">Nav</span> <span className="text-xs text-green-500 ml-2">MK-III</span></h1></div>
+             <div className="flex items-center gap-1.5 mt-1 ml-0.5"><div className={`w-1.5 h-1.5 rounded-full ${coords ? "bg-green-500 shadow-[0_0_5px_#22c55e]" : "bg-red-500"}`} /><span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">{coords ? "ONLINE" : "SEARCHING"}</span></div>
          </div>
-
-         <div className="flex gap-3 items-center">
-            {isRecording && (
-               <div className="hidden md:flex flex-col items-end mr-2 animate-in fade-in slide-in-from-right-4">
-                 <span className="text-[10px] text-muted-foreground font-bold uppercase tracking-wider">Distance</span>
-                 <span className="text-sm font-mono font-bold text-red-400 tabular-nums leading-none">
-                   {(recordedDistance / (units === 'metric' ? 1000 : 5280)).toFixed(2)}<span className="text-[10px] ml-1">{units === 'metric' ? 'km' : 'mi'}</span>
-                 </span>
-               </div>
-            )}
-            <button onClick={toggleRecording} className={`group flex items-center gap-2 px-4 py-2 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all active:scale-95 ${isRecording ? "bg-red-500/10 border-red-500/50 text-red-500 shadow-[0_0_10px_rgba(239,68,68,0.2)]" : "bg-white/5 border-white/10 text-muted-foreground hover:bg-white/10 hover:text-white"}`}>
-               {isRecording ? <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> : <Circle className="w-2 h-2 group-hover:text-white transition-colors" />}
-               {isRecording ? "REC" : "LOG"}
-            </button>
-            <button onClick={toggleUnits} className="px-3 py-2 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-bold uppercase tracking-wider text-muted-foreground hover:text-white transition-all active:scale-95">
-               {units === 'metric' ? 'MET' : 'IMP'}
-            </button>
-            
-            {/* Gesture Toggle */}
-            <button onClick={toggleGestures} className={`p-2 rounded-full border text-[10px] transition-all active:scale-95 ${isGestureMode ? "bg-green-500/10 border-green-500/50 text-green-500" : "bg-white/5 border-white/10 text-muted-foreground hover:text-white"}`}>
-               {isGestureMode ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
-            </button>
-
-            {/* Scanner Toggle */}
-            <button onClick={toggleScanner} className={`p-2 rounded-full border text-[10px] transition-all active:scale-95 ${isScannerMode ? "bg-green-500/10 border-green-500/50 text-green-500" : "bg-white/5 border-white/10 text-muted-foreground hover:text-white"}`}>
-               <Aperture className="w-4 h-4" />
-            </button>
+         <div className="flex gap-2 items-center">
+            <button onClick={handleAudioToggle} className={`p-2 rounded-full border text-[10px] transition-all ${audioEnabled ? "bg-green-500/10 text-green-500 border-green-500/50" : "bg-white/5 border-white/10 text-muted-foreground"}`}><Headphones className="w-4 h-4" /></button>
+            <button onClick={() => setStealthMode(!stealthMode)} className={`p-2 rounded-full border text-[10px] transition-all ${stealthMode ? "bg-red-900/20 text-red-500 border-red-500/50" : "bg-white/5 border-white/10 text-muted-foreground"}`}><EyeOff className="w-4 h-4" /></button>
+            <button onClick={() => { setArMode(!arMode); triggerHaptic(); }} className={`flex items-center gap-2 px-3 py-2 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all ${arMode ? "bg-green-500 text-black border-green-500" : "bg-white/5 border-white/10 text-muted-foreground"}`}><Aperture className="w-3 h-3" /> {arMode ? "HUD" : "2D"}</button>
+            <button onClick={() => setIsRecording(!isRecording)} className={`flex items-center gap-2 px-3 py-2 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all ${isRecording ? "bg-red-500/10 border-red-500/50 text-red-500" : "bg-white/5 border-white/10 text-muted-foreground"}`}>{isRecording ? "REC" : "LOG"}</button>
          </div>
       </div>
 
-      {isGestureMode && <GestureOps onToggleRecording={toggleRecording} onToggleMapMode={toggleMapMode} isRecording={isRecording} />}
       {isScannerMode && (
         <div className="fixed inset-0 z-50 animate-in fade-in zoom-in duration-300">
             <TacticalScanner />
-            <button onClick={toggleScanner} className="absolute top-4 right-4 z-[60] p-3 bg-black/50 border border-white/20 rounded-full text-white backdrop-blur-md">
-                <X className="w-6 h-6" />
-            </button>
+            <button onClick={() => setIsScannerMode(false)} className="absolute top-4 right-4 z-[60] p-3 bg-black/50 border border-white/20 rounded-full text-white backdrop-blur-md"><X className="w-6 h-6" /></button>
         </div>
       )}
 
-      <div className="w-full max-w-5xl flex flex-col items-center justify-start space-y-6 z-10">
-        {loading && !coords && (
-          <div className="flex flex-col items-center justify-center h-64 space-y-6 animate-pulse">
-            <Loader2 className="w-8 h-8 animate-spin text-green-500/50" />
-            <span className="text-xs tracking-[0.3em] uppercase text-green-500/70 font-bold">Acquiring Satellites...</span>
-          </div>
-        )}
+      {isGestureMode && <GestureOps onToggleRecording={() => setIsRecording(!isRecording)} onToggleMapMode={() => setMapMode(m => m==='2d'?'3d':'2d')} isRecording={isRecording} />}
 
-        {error && !coords && (
-           <Alert variant="destructive" className="max-w-md bg-red-950/20 border-red-900/50 text-red-200">
-             <AlertCircle className="h-4 w-4" />
-             <AlertTitle>Signal Error</AlertTitle>
-             <AlertDescription>{error}. Check device location settings.</AlertDescription>
-           </Alert>
-        )}
-
-        {showSaveButton && !isRecording && (
-          <div className="w-full max-w-md animate-in slide-in-from-top-4 fade-in">
-             <button onClick={downloadGPX} className="w-full py-4 rounded-xl bg-green-500 text-black font-bold uppercase tracking-widest shadow-[0_0_20px_rgba(34,197,94,0.4)] flex items-center justify-center gap-2 active:scale-95 transition-transform hover:bg-green-400">
-                <Download className="w-5 h-5" /> Download Log
-             </button>
-          </div>
-        )}
-
+      {/* Main Dashboard */}
+      <div className={`w-full max-w-5xl flex flex-col items-center z-10 space-y-6 transition-opacity duration-300 ${arMode ? 'opacity-80 hover:opacity-100' : 'opacity-100'}`}>
+        {loading && !coords && <div className="flex flex-col items-center justify-center h-64 space-y-4 animate-pulse"><Loader2 className="w-8 h-8 animate-spin text-green-500/50" /><span className="text-xs tracking-[0.3em] uppercase text-green-500/70 font-bold">Acquiring Satellites...</span></div>}
+        
         {coords && (
-          <div className="w-full grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 animate-in fade-in slide-in-from-bottom-8 duration-700">
-             <div className="lg:col-span-4 flex flex-col gap-4 order-2 lg:order-1">
-                 <DataCard className="space-y-4">
-                    <div className="flex items-center justify-between">
-                        <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-widest flex items-center gap-2">
-                           <MapPin className="w-3 h-3 text-green-500" /> Coordinates
-                        </span>
-                        <div className="flex gap-2">
-                          <button onClick={handleShare} className="p-1.5 hover:bg-white/10 rounded-md text-muted-foreground hover:text-white transition-colors"><Share2 className="w-3.5 h-3.5" /></button>
-                          <div className="flex items-center gap-1 px-2 py-1 bg-black/40 rounded border border-white/10">
-                             <Signal className={`w-3 h-3 ${(coords.accuracy || 100) < 15 ? 'text-green-500' : (coords.accuracy || 100) < 50 ? 'text-yellow-500' : 'text-red-500'}`} />
-                             <span className="text-[9px] font-mono font-bold text-white/70">GPS</span>
-                          </div>
-                        </div>
-                    </div>
+          <div className="w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+             {/* Left Panel: Data & Controls */}
+             <div className={`lg:col-span-4 flex flex-col gap-4 order-2 lg:order-1 ${arMode ? "hidden md:flex" : ""}`}>
+                 <div className="p-4 rounded-xl bg-[#111]/80 border border-white/10 backdrop-blur-md space-y-4 shadow-xl">
+                    <div className="flex items-center justify-between"><span className="text-[10px] uppercase font-bold text-muted-foreground tracking-widest flex items-center gap-2"><MapPin className="w-3 h-3 text-green-500" /> Position</span><div className="flex items-center gap-1 px-2 py-1 bg-black/40 rounded border border-white/10"><Signal className="w-3 h-3 text-green-500" /><span className="text-[9px] font-mono font-bold text-white/70">GPS</span></div></div>
                     <div className="space-y-2">
-                       <CoordinateRow label="LAT" value={coords.latitude} type="lat" />
-                       <CoordinateRow label="LNG" value={coords.longitude} type="lng" />
+                       <div className="flex justify-between p-2.5 rounded-lg bg-black/40 border border-white/5"><span className="text-[8px] uppercase tracking-widest font-bold text-muted-foreground">LAT</span><span className="text-lg font-mono font-medium text-foreground">{formatCoordinate(coords.latitude, 'lat')}</span></div>
+                       <div className="flex justify-between p-2.5 rounded-lg bg-black/40 border border-white/5"><span className="text-[8px] uppercase tracking-widest font-bold text-muted-foreground">LNG</span><span className="text-lg font-mono font-medium text-foreground">{formatCoordinate(coords.longitude, 'lng')}</span></div>
                     </div>
-                    <button onClick={() => { triggerHaptic(); setIsMapDrawerOpen(true); }} className="w-full py-3 rounded-lg bg-green-500/10 hover:bg-green-500/20 border border-green-500/20 text-green-500 text-[10px] font-bold uppercase tracking-widest flex items-center justify-center gap-2 transition-all active:scale-[0.98]">
-                      Expand Map View
-                    </button>
-                 </DataCard>
+                    <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/5">
+                        <button onClick={handleSetTarget} className={`py-3 rounded-lg border text-[10px] font-bold uppercase tracking-widest flex items-center justify-center gap-2 transition-all ${target?.active ? "bg-red-500/10 border-red-500/30 text-red-500" : "bg-blue-500/10 border-blue-500/20 text-blue-400"}`}>
+                            {target?.active ? <Trash2 className="w-3.5 h-3.5" /> : <Target className="w-3.5 h-3.5" />} {target?.active ? "Clear" : "Mark"}
+                        </button>
+                        <button onClick={handleManualTarget} className="py-3 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-white/70 text-[10px] font-bold uppercase tracking-widest">Input</button>
+                    </div>
+                 </div>
 
-                 <div className="grid grid-cols-3 gap-3 h-24">
-                    <StatCard icon={Mountain} label="ALT" value={convertAltitude(coords.altitude, units)} unit={units === 'metric' ? 'm' : 'ft'} />
-                    <StatCard icon={Activity} label="SPD" value={convertSpeed(coords.speed, units)} unit={units === 'metric' ? 'kph' : 'mph'} />
+                 {target?.active && targetMetrics ? (
+                     <div className="p-4 rounded-xl bg-blue-950/40 border border-blue-500/30 backdrop-blur-md flex items-center justify-between shadow-[0_0_15px_rgba(59,130,246,0.2)]">
+                         <div className="flex flex-col"><span className="text-[9px] uppercase font-bold text-blue-400 tracking-widest mb-1">Bearing</span><span className="text-2xl font-mono font-bold text-white tabular-nums">{Math.round(targetMetrics.bearing)}°</span></div>
+                         <div className="h-8 w-px bg-blue-500/20" />
+                         <div className="flex flex-col items-end"><span className="text-[9px] uppercase font-bold text-blue-400 tracking-widest mb-1">Range</span><span className="text-2xl font-mono font-bold text-white tabular-nums">{convertDistance(targetMetrics.dist, units)}</span></div>
+                     </div>
+                 ) : (
+                    weather && (
+                        <div className="p-4 rounded-xl bg-[#111]/60 border border-white/5 flex items-center justify-between">
+                            <div className="flex items-center gap-4">
+                                <Sun className="w-8 h-8 text-amber-500/80" />
+                                <div><div className="text-2xl font-mono font-bold">{convertTemp(weather.temp, units)}</div><div className="text-[10px] text-muted-foreground uppercase">{weather.description}</div></div>
+                            </div>
+                        </div>
+                    )
+                 )}
+
+                 <div className="grid grid-cols-3 gap-3">
+                    <StatCard icon={Mountain} label="ALT" value={convertAltitude(coords.altitude, units)} unit={units === 'metric'?'m':'ft'} />
+                    <StatCard icon={Activity} label="SPD" value={convertSpeed(coords.speed, units)} unit={units === 'metric'?'kph':'mph'} />
                     <StatCard icon={Navigation} label="ACC" value={coords.accuracy ? `±${Math.round(coords.accuracy)}` : '--'} unit="m" />
                  </div>
-
-                 {weather && weather.sunrise && <SolarCard sunrise={weather.sunrise} sunset={weather.sunset} />}
                  
-                 {weather && (
-                   <DataCard className="flex items-center justify-between !p-0 overflow-hidden bg-gradient-to-r from-blue-950/30 to-transparent">
-                      <div className="flex items-center gap-4 p-4">
-                          <div className="p-2.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20"><WeatherIcon className="w-5 h-5" /></div>
-                          <div className="flex flex-col">
-                             <span className="text-2xl font-mono font-bold tabular-nums leading-none tracking-tight">{convertTemp(weather.temp, units)}</span>
-                             <div className="flex items-center gap-2 mt-1.5">
-                               <span className="text-[9px] uppercase font-bold text-muted-foreground tracking-wide">{weather.description}</span>
-                               <span className="text-[9px] text-muted-foreground/30">|</span>
-                               <div className="flex items-center gap-1 text-[9px] font-bold text-muted-foreground"><Wind className="w-3 h-3" />{convertSpeed(weather.windSpeed / 3.6, units)}</div>
-                             </div>
-                          </div>
-                      </div>
-                      <div className="h-full px-4 border-l border-white/5 flex items-center justify-center bg-white/2">
-                         <span className="text-[9px] uppercase font-black text-muted-foreground rotate-180" style={{ writingMode: 'vertical-rl' }}>{address ? address.split(',')[0].slice(0, 12) : "LOCAL"}</span>
-                      </div>
-                   </DataCard>
-                 )}
+                 <div className="flex gap-2">
+                     <button onClick={() => setIsScannerMode(true)} className="flex-1 py-3 bg-white/5 border border-white/10 rounded-xl text-xs font-bold uppercase flex items-center justify-center gap-2 hover:bg-white/10"><Scan className="w-4 h-4"/> Optics</button>
+                     <button onClick={() => setIsGestureMode(!isGestureMode)} className={`flex-1 py-3 border rounded-xl text-xs font-bold uppercase flex items-center justify-center gap-2 ${isGestureMode ? "bg-green-500/20 text-green-500 border-green-500/50" : "bg-white/5 border-white/10"}`}><Hand className="w-4 h-4"/> Gestures</button>
+                 </div>
              </div>
 
-             <div className="lg:col-span-8 flex flex-col items-center justify-center order-1 lg:order-2">
-                 <div className="relative w-full flex flex-col items-center justify-center py-6 gap-6 md:gap-8">
-                     <div className="absolute inset-y-0 left-1/2 w-px bg-gradient-to-b from-transparent via-white/10 to-transparent -z-10" />
-                     <CompassDisplay 
-                        heading={effectiveHeading} 
-                        trueHeading={effectiveTrueHeading} 
-                        onClick={requestAccess} 
-                        hasError={!!compassError} 
-                        permissionGranted={permissionGranted}
-                        source={isMoving ? 'GPS' : 'MAG'}
-                     />
-                     <div className="relative z-10">
-                         <div className="absolute -top-8 left-1/2 -translate-x-1/2 w-px h-8 bg-gradient-to-b from-white/10 to-white/30" />
-                         <Inclinometer pitch={pitch} roll={roll} />
-                         <div className="absolute -bottom-8 left-1/2 -translate-x-1/2 w-px h-8 bg-gradient-to-t from-white/10 to-white/30" />
-                     </div>
-                     <div className="flex flex-col items-center gap-4 relative z-10 mt-2">
-                        <RadarMapbox 
-                          path={path} 
-                          lat={coords.latitude} 
-                          lng={coords.longitude} 
-                          heading={effectiveHeading || 0}
-                          mode={mapMode}
-                          accuracy={coords.accuracy}
-                          zoom={RADAR_ZOOM}
-                          onRecenter={recenterMap}
-                          onToggleMode={toggleMapMode}
-                        />
-                        {path.length > 1 && (
-                          <button onClick={() => { triggerHaptic(); recenterMap(); }} className="mt-8 text-[8px] text-muted-foreground hover:text-red-400 uppercase tracking-widest font-bold flex items-center gap-2 transition-colors py-1.5 px-3 rounded-full hover:bg-white/5 border border-transparent hover:border-red-500/20">
-                            <Trash2 className="w-3 h-3" /> Clear Trail
-                          </button>
-                        )}
+             {/* Right Panel: Visuals */}
+             <div className="lg:col-span-8 flex flex-col gap-6 order-1 lg:order-2 h-[50vh] lg:h-auto">
+                 {/* Map System */}
+                 <div className="relative w-full h-[400px] lg:h-[500px] rounded-2xl border border-white/10 overflow-hidden shadow-2xl bg-[#0c0c0c] group">
+                     {mapMode === '3d' ? (
+                        <Mapbox3D path={path} lat={coords.latitude} lng={coords.longitude} heading={effectiveHeading} target={target} />
+                     ) : (
+                         <RadarMapbox 
+                            path={path} lat={coords.latitude} lng={coords.longitude} heading={effectiveHeading} 
+                            mode={northRef} accuracy={coords.accuracy} 
+                            onRecenter={() => setPath([{ lat: coords.latitude, lng: coords.longitude, alt: coords.altitude, timestamp: Date.now() }])}
+                            onToggleMode={() => setNorthRef(n => n === 'heading-up' ? 'north-up' : 'heading-up')}
+                         />
+                     )}
+                     
+                     <div className="absolute bottom-4 left-4 flex gap-2">
+                         <button onClick={() => setMapMode(m => m==='2d'?'3d':'2d')} className="p-3 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-white hover:bg-white/10 transition-all">
+                            {mapMode==='2d' ? <Box className="w-5 h-5 text-blue-400" /> : <Globe className="w-5 h-5 text-green-400" />}
+                         </button>
                      </div>
                  </div>
+                 
+                 {/* Compass & Inclinometer */}
+                 {!arMode && (
+                     <div className="flex flex-col md:flex-row items-center justify-center gap-8 py-4">
+                         <CompassDisplay 
+                            heading={effectiveHeading} 
+                            trueHeading={isMoving ? coords.heading : trueHeading} 
+                            onClick={requestAccess} 
+                            hasError={!!compassError} 
+                            permissionGranted={permissionGranted}
+                            source={isMoving ? 'GPS' : 'MAG'}
+                            targetBearing={targetMetrics?.bearing ?? null}
+                         />
+                         <Inclinometer pitch={pitch} roll={roll} />
+                     </div>
+                 )}
              </div>
           </div>
         )}
+        
+        {recordedPath.length > 0 && !isRecording && (
+          <button onClick={downloadGPX} className="fixed bottom-8 left-1/2 -translate-x-1/2 px-8 py-4 rounded-full bg-green-500 text-black font-bold uppercase tracking-widest shadow-[0_0_20px_rgba(34,197,94,0.4)] flex items-center gap-2 animate-in slide-in-from-bottom-4 z-[60]"><Download className="w-5 h-5" /> Download Log</button>
+        )}
       </div>
-      {coords && <FullMapDrawer isOpen={isMapDrawerOpen} onClose={() => setIsMapDrawerOpen(false)} lat={coords.latitude} lng={coords.longitude} />}
     </main>
   );
 }
